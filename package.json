@@ -1,0 +1,30 @@
+{
+  "name": "@xe/erofs",
+  "version": "0.1.0",
+  "description": "erofs driver for fs.FS",
+  "homepage": "https://github.com/Xe/erofs#readme",
+  "bugs": {
+    "url": "https://github.com/Xe/erofs/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Xe/erofs.git"
+  },
+  "license": "CC0-1.0",
+  "author": "Xe Iaso <me@xeiaso.net>",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "go test ./...",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.go": "go tool goimports -w"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^20.5.0",
+    "@commitlint/config-conventional": "^20.5.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0"
+  }
+}

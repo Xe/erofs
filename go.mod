@@ -5,6 +5,8 @@ go 1.26.1
 tool golang.org/x/tools/cmd/goimports
 
 require (
+	github.com/klauspost/compress v1.18.5 // indirect
+	github.com/pierrec/lz4/v4 v4.1.26 // indirect
 	golang.org/x/mod v0.34.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect

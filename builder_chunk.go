@@ -53,6 +53,9 @@ func (b *Builder) AddChunkedFile(p string, info fs.FileInfo, chunks []ChunkRef) 
 	if b.chunkBits == 0 {
 		return fmt.Errorf("erofs: chunk size not set; use WithChunkSize")
 	}
+	if b.chunkBits < b.blkSzBits {
+		return fmt.Errorf("erofs: chunk size bits (%d) must be >= block size bits (%d)", b.chunkBits, b.blkSzBits)
+	}
 
 	ino := &buildInode{
 		path:       p,

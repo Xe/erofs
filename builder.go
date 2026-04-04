@@ -628,7 +628,16 @@ func (b *Builder) layoutDataBlocks() {
 		}
 	}
 
-	// Data blocks start at the next block boundary after metadata.
+	// If there is a device table, it goes between metadata and data blocks.
+	if b.maxDeviceID > 0 {
+		devtOff := alignUp(metaEnd, int64(ondisk.DevTSlotSize))
+		devtEnd := devtOff + int64(b.maxDeviceID)*int64(ondisk.DevTSlotSize)
+		if devtEnd > metaEnd {
+			metaEnd = devtEnd
+		}
+	}
+
+	// Data blocks start at the next block boundary after metadata (and device table).
 	dataStart := alignUp(metaEnd, int64(b.blockSize))
 	currentBlk := dataStart / int64(b.blockSize)
 
@@ -853,9 +862,13 @@ func (b *Builder) writeSuperblock() error {
 				uniAddr += info.Blocks
 			}
 			var slotBuf bytes.Buffer
-			binary.Write(&slotBuf, binary.LittleEndian, &slot)
+			if err := binary.Write(&slotBuf, binary.LittleEndian, &slot); err != nil {
+				return fmt.Errorf("erofs: encoding device slot %d: %w", i, err)
+			}
 			off := devtOff + int64(i-1)*int64(ondisk.DevTSlotSize)
-			b.w.WriteAt(slotBuf.Bytes(), off)
+			if _, err := b.w.WriteAt(slotBuf.Bytes(), off); err != nil {
+				return fmt.Errorf("erofs: writing device slot %d: %w", i, err)
+			}
 		}
 		// Include device table in total image size.
 		devtEnd := devtOff + int64(extraDevices)*int64(ondisk.DevTSlotSize)

@@ -23,6 +23,16 @@ type BlobInfo struct {
 	Blocks uint64   // total blocks in this blob
 }
 
+// WithFlatDevice enables flat device mode. In flat mode, all blob data is
+// mapped into a single unified address space. The builder computes UniAddr
+// offsets for each device so that a composed block device can be mounted
+// directly.
+func WithFlatDevice() BuildOption {
+	return func(b *Builder) {
+		b.flatDev = true
+	}
+}
+
 // WithChunkSize sets the chunk size as a power of two bit count (e.g., 12 for
 // 4096-byte chunks). Enables chunk-based inode layout for files added via
 // AddChunkedFile.

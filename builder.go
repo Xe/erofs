@@ -31,6 +31,7 @@ type Builder struct {
 	chunkBits       uint8               // 0 means chunk mode disabled
 	maxDeviceID     uint16              // highest device ID seen in AddChunkedFile
 	blobInfos       map[uint16]BlobInfo // device ID -> blob metadata
+	flatDev         bool                // flat device mode: compute UniAddr for each device
 }
 
 type buildInode struct {
@@ -831,12 +832,25 @@ func (b *Builder) writeSuperblock() error {
 		}
 		devtOff := alignUp(metaEnd, int64(ondisk.DevTSlotSize))
 		devtSlotOff = uint16(devtOff / int64(ondisk.DevTSlotSize))
+
+		// In flat mode, compute cumulative unified addresses starting after
+		// the image's own blocks.
+		var uniAddr uint64
+		if b.flatDev {
+			uniAddr = uint64(totalBlocks)
+		}
+
 		for i := uint16(1); i <= extraDevices; i++ {
 			info := b.blobInfos[i]
 			slot := ondisk.DeviceSlot{
 				Tag:      info.Tag,
 				BlocksLo: uint32(info.Blocks),
 				BlocksHi: uint32(info.Blocks >> 32),
+			}
+			if b.flatDev {
+				slot.UniAddrLo = uint32(uniAddr)
+				slot.UniAddrHi = uint16(uniAddr >> 32)
+				uniAddr += info.Blocks
 			}
 			var slotBuf bytes.Buffer
 			binary.Write(&slotBuf, binary.LittleEndian, &slot)

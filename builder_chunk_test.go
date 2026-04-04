@@ -8,6 +8,82 @@ import (
 	"time"
 )
 
+func TestBuilderFlatDeviceRoundTrip(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	blob0Data := bytes.Repeat([]byte{0xAA}, 4096)
+	blob1Data := bytes.Repeat([]byte{0xBB}, 4096)
+
+	imgBuf := newWriterAtBuffer(128 * 1024)
+	b := NewBuilder(imgBuf, WithBlockSize(12), WithEpoch(epoch), WithChunkSize(12), WithFlatDevice())
+
+	b.AddDir("/", &staticFileInfo{name: "/", mode: fs.ModeDir | 0o755, mod: epoch})
+
+	b.SetBlobInfo(1, BlobInfo{Blocks: 1})
+	b.SetBlobInfo(2, BlobInfo{Blocks: 1})
+
+	b.AddChunkedFile("/file0.bin", &staticFileInfo{
+		name: "file0.bin", mode: 0o644, size: 4096, mod: epoch,
+	}, []ChunkRef{{DeviceID: 1, BlkAddr: 0, Size: 4096}})
+
+	b.AddChunkedFile("/file1.bin", &staticFileInfo{
+		name: "file1.bin", mode: 0o644, size: 4096, mod: epoch,
+	}, []ChunkRef{{DeviceID: 2, BlkAddr: 0, Size: 4096}})
+
+	if err := b.Build(); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	img := imgBuf.Bytes()
+
+	// Open to read device table and verify flat mode.
+	fsys, err := Open(bytes.NewReader(img))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if !fsys.flatDev {
+		t.Fatal("expected flatDev to be true")
+	}
+	if len(fsys.devices) != 2 {
+		t.Fatalf("expected 2 devices, got %d", len(fsys.devices))
+	}
+
+	// Build the composed flat image: [image | blob0 | blob1]
+	totalSize := len(img)
+	for _, dev := range fsys.devices {
+		end := int((dev.UniAddr + dev.Blocks)) << 12
+		if end > totalSize {
+			totalSize = end
+		}
+	}
+	flat := make([]byte, totalSize)
+	copy(flat, img)
+	copy(flat[int(fsys.devices[0].UniAddr)<<12:], blob0Data)
+	copy(flat[int(fsys.devices[1].UniAddr)<<12:], blob1Data)
+
+	fsys2, err := Open(bytes.NewReader(flat))
+	if err != nil {
+		t.Fatalf("Open flat: %v", err)
+	}
+
+	data0, err := fs.ReadFile(fsys2, "file0.bin")
+	if err != nil {
+		t.Fatalf("ReadFile file0.bin: %v", err)
+	}
+	if !bytes.Equal(data0, blob0Data) {
+		t.Error("file0.bin content mismatch")
+	}
+
+	data1, err := fs.ReadFile(fsys2, "file1.bin")
+	if err != nil {
+		t.Fatalf("ReadFile file1.bin: %v", err)
+	}
+	if !bytes.Equal(data1, blob1Data) {
+		t.Error("file1.bin content mismatch")
+	}
+}
+
 func TestBuilderChunkBasedRoundTrip(t *testing.T) {
 	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	imgBuf := newWriterAtBuffer(64 * 1024)

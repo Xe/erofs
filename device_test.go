@@ -3,7 +3,9 @@ package erofs
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
+	"time"
 
 	"github.com/Xe/erofs/internal/ondisk"
 )
@@ -45,6 +47,22 @@ func TestParseDeviceTable(t *testing.T) {
 	}
 	if string(bytes.TrimRight(devs[0].Tag[:], "\x00")) != "blob0" {
 		t.Errorf("dev[0].Tag = %q, want blob0", devs[0].Tag)
+	}
+}
+
+func TestOpenMultiBlobRejectsMismatch(t *testing.T) {
+	// Build a normal (no extra devices) image.
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	buf := newWriterAtBuffer(8192)
+	b := NewBuilder(buf, WithBlockSize(12), WithEpoch(epoch))
+	b.Build()
+
+	img := bytes.NewReader(buf.Bytes())
+
+	// Providing blobs to an image with 0 extra devices should error.
+	_, err := OpenMultiBlob(img, []io.ReaderAt{bytes.NewReader(nil)})
+	if err == nil {
+		t.Fatal("expected error for blob count mismatch, got nil")
 	}
 }
 

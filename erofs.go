@@ -38,6 +38,11 @@ type FS struct {
 	epoch       int64
 	fixedNsec   uint32
 	sb          *ondisk.SuperBlock
+
+	devices      []DeviceInfo  // parsed device table (len == sb.ExtraDevices)
+	blobs        []io.ReaderAt // external blob readers (one per extra device)
+	deviceIDMask uint16        // bitmask for valid device IDs
+	flatDev      bool          // flat addressing mode
 }
 
 // Open opens an EROFS filesystem image from the given io.ReaderAt.
@@ -80,7 +85,54 @@ func Open(r io.ReaderAt) (*FS, error) {
 		return nil, fmt.Errorf("erofs: root inode is not a directory")
 	}
 
+	// Parse device table if present.
+	if sb.ExtraDevices > 0 {
+		devtOff := int64(sb.DevtSlotOff) * int64(ondisk.DevTSlotSize)
+		devs, err := parseDeviceTable(r, sb.ExtraDevices, devtOff)
+		if err != nil {
+			return nil, err
+		}
+		f.devices = devs
+		f.deviceIDMask = computeDeviceIDMask(sb.ExtraDevices)
+		f.flatDev = true // default to flat; OpenMultiBlob sets to false
+	}
+
 	return f, nil
+}
+
+// OpenMultiBlob opens a multi-blob EROFS image. The primary image is read
+// from r. Each extra device listed in the superblock's device table is
+// backed by the corresponding entry in blobs. The length of blobs must
+// equal the superblock's ExtraDevices count.
+//
+// For images with no extra devices, use Open() instead.
+func OpenMultiBlob(r io.ReaderAt, blobs []io.ReaderAt) (*FS, error) {
+	f, err := Open(r)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(blobs) != len(f.devices) {
+		return nil, fmt.Errorf("erofs: blob count mismatch: got %d, image has %d extra devices",
+			len(blobs), len(f.devices))
+	}
+
+	f.blobs = blobs
+	f.flatDev = false
+	return f, nil
+}
+
+// readerForDevice returns the io.ReaderAt for the given device ID.
+// Device ID 0 is the primary image. Device IDs 1..N map to blobs[0..N-1].
+func (f *FS) readerForDevice(deviceID uint16) io.ReaderAt {
+	if deviceID == 0 || f.blobs == nil {
+		return f.r
+	}
+	idx := int(deviceID) - 1
+	if idx >= len(f.blobs) {
+		return f.r // fallback; shouldn't happen with valid images
+	}
+	return f.blobs[idx]
 }
 
 // Open opens the named file.

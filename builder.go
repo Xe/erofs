@@ -28,6 +28,10 @@ type Builder struct {
 	compression     CompressionAlgorithm
 	compressEnabled bool
 	compressedData  map[*buildInode]*compressedFileData
+	chunkBits       uint8               // 0 means chunk mode disabled
+	maxDeviceID     uint16              // highest device ID seen in AddChunkedFile
+	blobInfos       map[uint16]BlobInfo // device ID -> blob metadata
+	flatDev         bool                // flat device mode: compute UniAddr for each device
 }
 
 type buildInode struct {
@@ -43,6 +47,7 @@ type buildInode struct {
 	metaOff    int64 // absolute byte offset where metadata is written
 	metaSize   int   // total metadata bytes (inode + inline tail)
 	children   []buildDirent
+	chunks     []ChunkRef // chunk references (for InodeChunkBased layout)
 }
 
 type buildDirent struct {
@@ -493,6 +498,12 @@ func (b *Builder) tryCompressInodes() {
 // computeLayouts decides FLAT_INLINE vs FLAT_PLAIN for each inode.
 func (b *Builder) computeLayouts() {
 	for _, ino := range b.inodes {
+		if ino.dataLayout == ondisk.InodeChunkBased {
+			// Chunk-based: metadata = 64-byte inode + 8 bytes per chunk index.
+			ino.metaSize = 64 + 8*len(ino.chunks)
+			continue
+		}
+
 		dataLen := int64(len(ino.data))
 		inodeHeaderSize := 64 // extended inode only
 		tailSize := int(dataLen) % b.blockSize
@@ -617,7 +628,16 @@ func (b *Builder) layoutDataBlocks() {
 		}
 	}
 
-	// Data blocks start at the next block boundary after metadata.
+	// If there is a device table, it goes between metadata and data blocks.
+	if b.maxDeviceID > 0 {
+		devtOff := alignUp(metaEnd, int64(ondisk.DevTSlotSize))
+		devtEnd := devtOff + int64(b.maxDeviceID)*int64(ondisk.DevTSlotSize)
+		if devtEnd > metaEnd {
+			metaEnd = devtEnd
+		}
+	}
+
+	// Data blocks start at the next block boundary after metadata (and device table).
 	dataStart := alignUp(metaEnd, int64(b.blockSize))
 	currentBlk := dataStart / int64(b.blockSize)
 
@@ -667,6 +687,10 @@ func (b *Builder) writeMetadata() error {
 }
 
 func (b *Builder) writeInode(ino *buildInode) error {
+	if ino.dataLayout == ondisk.InodeChunkBased {
+		return b.writeChunkedInode(ino)
+	}
+
 	// Build the extended inode.
 	ei := ondisk.InodeExtended{
 		Format:    uint16(ondisk.InodeLayoutExtended) | uint16(ino.dataLayout)<<ondisk.IDataLayoutBit,
@@ -803,6 +827,58 @@ func (b *Builder) writeSuperblock() error {
 	}
 	totalBlocks := uint32((maxOff + int64(b.blockSize) - 1) / int64(b.blockSize))
 
+	// Write device table if we have extra devices.
+	var devtSlotOff uint16
+	var extraDevices uint16
+	if b.maxDeviceID > 0 {
+		extraDevices = b.maxDeviceID
+		var metaEnd int64
+		for _, ino := range b.inodes {
+			end := ino.metaOff + int64(ino.metaSize)
+			if end > metaEnd {
+				metaEnd = end
+			}
+		}
+		devtOff := alignUp(metaEnd, int64(ondisk.DevTSlotSize))
+		devtSlotOff = uint16(devtOff / int64(ondisk.DevTSlotSize))
+
+		// In flat mode, compute cumulative unified addresses starting after
+		// the image's own blocks.
+		var uniAddr uint64
+		if b.flatDev {
+			uniAddr = uint64(totalBlocks)
+		}
+
+		for i := uint16(1); i <= extraDevices; i++ {
+			info := b.blobInfos[i]
+			slot := ondisk.DeviceSlot{
+				Tag:      info.Tag,
+				BlocksLo: uint32(info.Blocks),
+				BlocksHi: uint32(info.Blocks >> 32),
+			}
+			if b.flatDev {
+				slot.UniAddrLo = uint32(uniAddr)
+				slot.UniAddrHi = uint16(uniAddr >> 32)
+				uniAddr += info.Blocks
+			}
+			var slotBuf bytes.Buffer
+			if err := binary.Write(&slotBuf, binary.LittleEndian, &slot); err != nil {
+				return fmt.Errorf("erofs: encoding device slot %d: %w", i, err)
+			}
+			off := devtOff + int64(i-1)*int64(ondisk.DevTSlotSize)
+			if _, err := b.w.WriteAt(slotBuf.Bytes(), off); err != nil {
+				return fmt.Errorf("erofs: writing device slot %d: %w", i, err)
+			}
+		}
+		// Include device table in total image size.
+		devtEnd := devtOff + int64(extraDevices)*int64(ondisk.DevTSlotSize)
+		if devtEnd > maxOff {
+			maxOff = devtEnd
+		}
+		// Recompute totalBlocks after device table.
+		totalBlocks = uint32((maxOff + int64(b.blockSize) - 1) / int64(b.blockSize))
+	}
+
 	sb := ondisk.SuperBlock{
 		Magic:           ondisk.SuperMagic,
 		FeatureCompat:   ondisk.FeatureCompatSBChksum | ondisk.FeatureCompatMtime,
@@ -815,6 +891,8 @@ func (b *Builder) writeSuperblock() error {
 		FeatureIncompat: b.computeIncompatFeatures(),
 		BuildTime:       uint32(time.Now().Unix() - b.epoch),
 		AvailComprAlgs:  b.computeComprAlgs(),
+		ExtraDevices:    extraDevices,
+		DevtSlotOff:     devtSlotOff,
 	}
 
 	// Also set RootNID8B for larger NID values.
@@ -865,6 +943,12 @@ func (b *Builder) computeIncompatFeatures() uint32 {
 	var flags uint32
 	if len(b.compressedData) > 0 {
 		flags |= ondisk.FeatureIncompatZeroPadding
+	}
+	if b.chunkBits > 0 {
+		flags |= ondisk.FeatureIncompatChunkedFile
+	}
+	if b.maxDeviceID > 0 {
+		flags |= ondisk.FeatureIncompatDeviceTable
 	}
 	return flags
 }

@@ -54,6 +54,27 @@ func main() {
 	fmt.Printf("BlocksLo:         %d\n", sb.BlocksLo)
 	fmt.Printf("Inos:             %d\n", sb.Inos)
 
+	if sb.ExtraDevices > 0 {
+		fmt.Printf("ExtraDevices:     %d\n", sb.ExtraDevices)
+		fmt.Printf("DevtSlotOff:      %d (byte offset: %d)\n", sb.DevtSlotOff, int64(sb.DevtSlotOff)*128)
+
+		devtOff := int64(sb.DevtSlotOff) * int64(ondisk.DevTSlotSize)
+		for i := uint16(0); i < sb.ExtraDevices; i++ {
+			slotBuf := make([]byte, ondisk.DevTSlotSize)
+			if _, err := f.ReadAt(slotBuf, devtOff+int64(i)*int64(ondisk.DevTSlotSize)); err != nil {
+				fmt.Fprintf(os.Stderr, "reading device slot %d: %v\n", i, err)
+				continue
+			}
+			var slot ondisk.DeviceSlot
+			binary.Read(bytes.NewReader(slotBuf), binary.LittleEndian, &slot)
+
+			blocks := uint64(slot.BlocksLo) | uint64(slot.BlocksHi)<<32
+			uniAddr := uint64(slot.UniAddrLo) | uint64(slot.UniAddrHi)<<32
+			tag := bytes.TrimRight(slot.Tag[:], "\x00")
+			fmt.Printf("  Device %d: blocks=%d uniaddr=%d tag=%q\n", i+1, blocks, uniAddr, tag)
+		}
+	}
+
 	if sb.AvailComprAlgs&(1<<ondisk.CompressionLZ4) != 0 {
 		fmt.Println("  -> LZ4 compression available")
 	}

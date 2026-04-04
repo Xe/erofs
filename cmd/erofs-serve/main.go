@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -12,7 +13,8 @@ import (
 )
 
 var (
-	bind = pflag.StringP("bind", "b", ":9906", "TCP port to bind HTTP")
+	bind  = pflag.StringP("bind", "b", ":9906", "TCP port to bind HTTP")
+	blobs = pflag.StringSliceP("blob", "B", nil, "external blob files (in device ID order)")
 )
 
 func main() {
@@ -42,12 +44,26 @@ func run(fname string) error {
 	}
 	defer fin.Close()
 
-	fs, err := erofs.Open(fin)
+	var fsys *erofs.FS
+	if len(*blobs) > 0 {
+		blobReaders := make([]io.ReaderAt, len(*blobs))
+		for i, blobPath := range *blobs {
+			bf, err := os.Open(blobPath)
+			if err != nil {
+				return fmt.Errorf("can't open blob %s: %w", blobPath, err)
+			}
+			defer bf.Close()
+			blobReaders[i] = bf
+		}
+		fsys, err = erofs.OpenMultiBlob(fin, blobReaders)
+	} else {
+		fsys, err = erofs.Open(fin)
+	}
 	if err != nil {
-		return fmt.Errorf("can't erofs.Open: %w", err)
+		return fmt.Errorf("can't open erofs image: %w", err)
 	}
 
-	http.Handle("/", http.FileServer(http.FS(fs)))
+	http.Handle("/", http.FileServer(http.FS(fsys)))
 	log.Printf("Serving %s on %s", fname, *bind)
 	return http.ListenAndServe(*bind, nil)
 }

@@ -133,3 +133,98 @@ func TestBuilderChunkBasedRoundTrip(t *testing.T) {
 		t.Errorf("content mismatch: got %d bytes", len(data))
 	}
 }
+
+func TestBuilderMultiChunkFile(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	imgBuf := newWriterAtBuffer(64 * 1024)
+
+	// 2 chunks of 4096 bytes each, on different devices.
+	chunk0 := bytes.Repeat([]byte{0x11}, 4096)
+	chunk1 := bytes.Repeat([]byte{0x22}, 4096)
+	blob0Buf := newWriterAtBuffer(8192)
+	blob0Buf.WriteAt(chunk0, 0)
+	blob1Buf := newWriterAtBuffer(8192)
+	blob1Buf.WriteAt(chunk1, 0)
+
+	b := NewBuilder(imgBuf, WithBlockSize(12), WithEpoch(epoch), WithChunkSize(12))
+	b.AddDir("/", &staticFileInfo{name: "/", mode: fs.ModeDir | 0o755, mod: epoch})
+	b.SetBlobInfo(1, BlobInfo{Blocks: 1})
+	b.SetBlobInfo(2, BlobInfo{Blocks: 1})
+
+	b.AddChunkedFile("/split.bin", &staticFileInfo{
+		name: "split.bin", mode: 0o644, size: 8192, mod: epoch,
+	}, []ChunkRef{
+		{DeviceID: 1, BlkAddr: 0, Size: 4096},
+		{DeviceID: 2, BlkAddr: 0, Size: 4096},
+	})
+
+	if err := b.Build(); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	fsys, err := OpenMultiBlob(
+		bytes.NewReader(imgBuf.Bytes()),
+		[]io.ReaderAt{bytes.NewReader(blob0Buf.Bytes()), bytes.NewReader(blob1Buf.Bytes())},
+	)
+	if err != nil {
+		t.Fatalf("OpenMultiBlob: %v", err)
+	}
+
+	data, err := fs.ReadFile(fsys, "split.bin")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	want := append(chunk0, chunk1...)
+	if !bytes.Equal(data, want) {
+		t.Errorf("content mismatch: got %d bytes", len(data))
+	}
+}
+
+func TestBuilderChunkWithHole(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	imgBuf := newWriterAtBuffer(64 * 1024)
+
+	blobData := bytes.Repeat([]byte{0xFF}, 4096)
+	blobBuf := newWriterAtBuffer(8192)
+	blobBuf.WriteAt(blobData, 0)
+
+	b := NewBuilder(imgBuf, WithBlockSize(12), WithEpoch(epoch), WithChunkSize(12))
+	b.AddDir("/", &staticFileInfo{name: "/", mode: fs.ModeDir | 0o755, mod: epoch})
+	b.SetBlobInfo(1, BlobInfo{Blocks: 1})
+
+	// 2 chunks: first is a hole (NullAddr), second has data.
+	b.AddChunkedFile("/sparse.bin", &staticFileInfo{
+		name: "sparse.bin", mode: 0o644, size: 8192, mod: epoch,
+	}, []ChunkRef{
+		{DeviceID: 0, BlkAddr: 0xFFFFFFFF, Size: 4096}, // hole
+		{DeviceID: 1, BlkAddr: 0, Size: 4096},
+	})
+
+	if err := b.Build(); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	fsys, err := OpenMultiBlob(
+		bytes.NewReader(imgBuf.Bytes()),
+		[]io.ReaderAt{bytes.NewReader(blobBuf.Bytes())},
+	)
+	if err != nil {
+		t.Fatalf("OpenMultiBlob: %v", err)
+	}
+
+	data, err := fs.ReadFile(fsys, "sparse.bin")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	// First 4096 bytes should be zeros (hole), next 4096 should be 0xFF.
+	for i := 0; i < 4096; i++ {
+		if data[i] != 0 {
+			t.Fatalf("byte %d in hole = %02x, want 0", i, data[i])
+		}
+	}
+	for i := 4096; i < 8192; i++ {
+		if data[i] != 0xFF {
+			t.Fatalf("byte %d in data = %02x, want FF", i, data[i])
+		}
+	}
+}

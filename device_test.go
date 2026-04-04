@@ -66,6 +66,32 @@ func TestOpenMultiBlobRejectsMismatch(t *testing.T) {
 	}
 }
 
+func TestReaderForDevice(t *testing.T) {
+	primary := bytes.NewReader([]byte("primary-data"))
+	blob0 := bytes.NewReader([]byte("blob0-data"))
+
+	f := &FS{
+		r:            primary,
+		blobs:        []io.ReaderAt{blob0},
+		deviceIDMask: 1,
+		devices: []DeviceInfo{
+			{Blocks: 10, UniAddr: 0},
+		},
+	}
+
+	// Device ID 0 = primary.
+	r := f.readerForDevice(0)
+	if r != primary {
+		t.Error("device 0 should return primary reader")
+	}
+
+	// Device ID 1 = first blob (index 0).
+	r = f.readerForDevice(1)
+	if r != blob0 {
+		t.Error("device 1 should return blob0 reader")
+	}
+}
+
 func TestDeviceIDMask(t *testing.T) {
 	tests := []struct {
 		extraDevices uint16

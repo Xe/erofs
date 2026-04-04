@@ -176,6 +176,7 @@ func (fi *file) readChunkBased(p []byte, off int64) (int, error) {
 	}
 
 	var blkAddr uint64
+	var deviceID uint16
 	if entrySize == 8 {
 		idx := ondisk.ChunkIndex{
 			StartBlkHi: le16(entryBuf[0:2]),
@@ -183,18 +184,41 @@ func (fi *file) readChunkBased(p []byte, off int64) (int, error) {
 			StartBlkLo: le32(entryBuf[4:8]),
 		}
 		blkAddr = uint64(idx.StartBlkLo) | uint64(idx.StartBlkHi)<<32
+		deviceID = idx.DeviceID & fi.fsys.deviceIDMask
 	} else {
 		blkAddr = uint64(le32(entryBuf[0:4]))
 	}
 
-	if blkAddr == ondisk.NullAddr {
+	// Check for hole. NullAddr is 0xFFFFFFFF for 32-bit entries.
+	// For 8-byte indexed entries, check based on address width.
+	isHole := false
+	if entrySize == 4 {
+		isHole = uint32(blkAddr) == uint32(ondisk.NullAddr)
+	} else {
+		if ino.chunkFormat&ondisk.ChunkFormat48Bit != 0 {
+			isHole = blkAddr&0xFFFFFFFFFFFF == 0xFFFFFFFFFFFF
+		} else {
+			isHole = uint32(blkAddr) == uint32(ondisk.NullAddr)
+		}
+	}
+	if isHole {
 		// Hole - return zeros.
 		clear(p)
 		return len(p), nil
 	}
 
 	pa := int64(blkAddr)<<fi.fsys.blockSzBits + chunkOff
-	return fi.fsys.r.ReadAt(p, pa)
+
+	// In flat device mode, adjust by the device's unified address.
+	if fi.fsys.flatDev && deviceID > 0 {
+		idx := int(deviceID) - 1
+		if idx < len(fi.fsys.devices) {
+			pa += int64(fi.fsys.devices[idx].UniAddr) << fi.fsys.blockSzBits
+		}
+		return fi.fsys.r.ReadAt(p, pa)
+	}
+
+	return fi.fsys.readerForDevice(deviceID).ReadAt(p, pa)
 }
 
 func baseName(name string) string {

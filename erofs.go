@@ -122,6 +122,19 @@ func OpenMultiBlob(r io.ReaderAt, blobs []io.ReaderAt) (*FS, error) {
 	return f, nil
 }
 
+// readerForDevice returns the io.ReaderAt for the given device ID.
+// Device ID 0 is the primary image. Device IDs 1..N map to blobs[0..N-1].
+func (f *FS) readerForDevice(deviceID uint16) io.ReaderAt {
+	if deviceID == 0 || f.blobs == nil {
+		return f.r
+	}
+	idx := int(deviceID) - 1
+	if idx >= len(f.blobs) {
+		return f.r // fallback; shouldn't happen with valid images
+	}
+	return f.blobs[idx]
+}
+
 // Open opens the named file.
 func (f *FS) Open(name string) (fs.File, error) {
 	if !fs.ValidPath(name) {

@@ -525,17 +525,21 @@ func lz4Decompress(src, dst []byte) (int, error) {
 
 // zstdDecompress decompresses ZSTD data.
 func zstdDecompress(src, dst []byte) (int, error) {
-	decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+	r, err := zstd.NewReader(bytes.NewReader(src), zstd.WithDecoderConcurrency(1))
 	if err != nil {
 		return 0, err
 	}
-	defer decoder.Close()
-	result, err := decoder.DecodeAll(src, dst[:0])
-	if err != nil {
-		return 0, err
+	defer r.Close()
+	n, err := io.ReadFull(r, dst)
+	// The pcluster is zero-padded past the end of the zstd frame; once we
+	// have read the expected decompressed size we stop and ignore the rest.
+	if err == io.ErrUnexpectedEOF || err == io.EOF {
+		return n, nil
 	}
-	copy(dst, result)
-	return len(result), nil
+	if err != nil {
+		return n, err
+	}
+	return n, nil
 }
 
 // deflateDecompress decompresses DEFLATE data.

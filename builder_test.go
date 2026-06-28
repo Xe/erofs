@@ -600,6 +600,58 @@ func TestBuilderZstdAvailComprAlgs(t *testing.T) {
 	}
 }
 
+func TestBuilderZstdComprCfgs(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	buf := newWriterAtBuffer(256 * 1024)
+
+	b := NewBuilder(buf, WithBlockSize(12), WithEpoch(epoch), WithCompression(CompressionZstd))
+	b.AddDir("/", &staticFileInfo{name: "/", mode: fs.ModeDir | 0o755, mod: epoch})
+	data := bytes.Repeat([]byte("zstd cfgs record check\n"), 500)
+	b.AddFile("/big.txt", &staticFileInfo{
+		name: "big.txt", mode: 0o644, size: int64(len(data)), mod: epoch,
+	}, data)
+	if err := b.Build(); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	img := buf.Bytes()
+
+	// feature_incompat is a __le32 at superblock offset 80.
+	feat := binary.LittleEndian.Uint32(img[1024+80:])
+	if feat&ondisk.FeatureIncompatComprCfgs == 0 {
+		t.Fatalf("FeatureIncompatComprCfgs not set: feat=0x%08x", feat)
+	}
+
+	// compr_cfgs record sits right after the 144-byte superblock: at 1024+144.
+	off := 1024 + 144
+	size := binary.LittleEndian.Uint16(img[off:])
+	if size != 32 {
+		t.Fatalf("zstd cfgs size = %d, want 32", size)
+	}
+	format := img[off+2]
+	windowLog := img[off+3]
+	if format != 0 {
+		t.Fatalf("zstd cfgs format = %d, want 0", format)
+	}
+	// blkSzBits 12, window log 12, on-disk = 12 - 10 = 2.
+	if windowLog != 2 {
+		t.Fatalf("zstd cfgs windowlog = %d, want 2", windowLog)
+	}
+
+	// The image must still read back correctly with the shifted metadata
+	// (this also verifies the superblock checksum still validates).
+	fsys, err := Open(bytes.NewReader(img))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	got, err := fs.ReadFile(fsys, "big.txt")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("content mismatch after cfgs shift")
+	}
+}
+
 // staticFileInfo implements fs.FileInfo for testing.
 type staticFileInfo struct {
 	name string

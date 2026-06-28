@@ -263,6 +263,13 @@ func (b *Builder) Build() error {
 		return err
 	}
 
+	// Write the compression-config area (zstd only) BEFORE the superblock,
+	// because the superblock checksum covers the first block including this
+	// region.
+	if err := b.writeComprCfgs(); err != nil {
+		return fmt.Errorf("erofs: writing compr cfgs: %w", err)
+	}
+
 	// Step 8: Write superblock.
 	if err := b.writeSuperblock(); err != nil {
 		return err
@@ -563,9 +570,9 @@ func (b *Builder) assignNIDs() {
 		return a.path < bI.path
 	})
 
-	// Start after the superblock region.
-	// Superblock ends at 1024 + 144 = 1168. Align to 32 = 1184.
-	sbEnd := int64(ondisk.SuperOffset) + 144
+	// Start after the superblock and, for zstd, the compression-config area.
+	// Superblock ends at 1024 + 144 = 1168; cfgs (if any) follow it.
+	sbEnd := int64(ondisk.SuperOffset) + 144 + b.comprCfgsSize()
 	slotOff := alignUp(sbEnd, ondisk.ISlotSize)
 
 	for _, ino := range b.inodes {
@@ -945,6 +952,9 @@ func (b *Builder) computeIncompatFeatures() uint32 {
 	var flags uint32
 	if len(b.compressedData) > 0 {
 		flags |= ondisk.FeatureIncompatZeroPadding
+		if b.compression == CompressionZstd {
+			flags |= ondisk.FeatureIncompatComprCfgs
+		}
 	}
 	if b.chunkBits > 0 {
 		flags |= ondisk.FeatureIncompatChunkedFile
@@ -961,6 +971,36 @@ func (b *Builder) computeIncompatFeatures() uint32 {
 // CompressionNone.
 func (b *Builder) comprAlgID() uint8 {
 	return uint8(b.compression)
+}
+
+// comprCfgsSize returns the number of bytes occupied by the compression-config
+// area that immediately follows the superblock. Only zstd needs it; the record
+// is a __le16 size (2 bytes) followed by a 32-byte z_erofs_zstd_cfgs struct.
+func (b *Builder) comprCfgsSize() int64 {
+	if len(b.compressedData) == 0 || b.compression != CompressionZstd {
+		return 0
+	}
+	return 2 + 32
+}
+
+// writeComprCfgs writes the compression-config area for zstd images. The kernel
+// reads it from EROFS_SUPER_OFFSET + sizeof(superblock); this builder's
+// superblock is 144 bytes, so the area starts at byte 1024+144. Must be called
+// before writeSuperblock, because the superblock checksum covers this region.
+func (b *Builder) writeComprCfgs() error {
+	if b.comprCfgsSize() == 0 {
+		return nil
+	}
+	off := int64(ondisk.SuperOffset) + 144
+	buf := make([]byte, b.comprCfgsSize())
+	binary.LittleEndian.PutUint16(buf[0:], 32) // sizeof(z_erofs_zstd_cfgs)
+	buf[2] = 0                                 // format
+	buf[3] = b.blkSzBits - 10                  // window log - ZSTD_WINDOWLOG_ABSOLUTEMIN
+	// buf[4:34] reserved, already zero.
+	if _, err := b.w.WriteAt(buf, off); err != nil {
+		return err
+	}
+	return nil
 }
 
 // computeComprAlgs returns the available compression algorithms bitmap.

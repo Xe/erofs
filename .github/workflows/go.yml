@@ -39,3 +39,55 @@ jobs:
 
       - name: Test
         run: go test -v ./...
+
+  zstd_image:
+    name: Build and verify a zstd image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: stable
+
+      - name: Build CLI tools
+        run: go build -o mkfs.erofs ./cmd/mkfs.erofs
+
+      - name: Create a sample tree
+        run: |
+          mkdir -p sample/nested
+          # Large, repetitive file so it is eligible for (and benefits from) compression.
+          yes 'the quick brown fox jumps over the lazy dog' | head -n 4000 > sample/big.txt
+          printf 'hello zstd\n' > sample/small.txt
+          printf 'nested file contents\n' > sample/nested/file.txt
+
+      - name: Build a zstd-compressed image
+        run: ./mkfs.erofs -i sample -o test-zstd.img -z zstd
+
+      - name: Assert the image is genuinely zstd
+        run: |
+          go run ./cmd/erofs-inspect test-zstd.img | tee inspect.txt
+          # available_compr_algs must advertise Zstandard (bit 3 -> 0x0008).
+          grep -Eq 'AvailComprAlgs:[[:space:]]+0x0008' inspect.txt
+          # feature_incompat must carry the compr_cfgs bit (0x2); zero-padding (0x1)
+          # is also set, so the value is 0x00000003.
+          grep -Eq 'FeatureIncompat:[[:space:]]+0x00000003' inspect.txt
+          # At least one inode must use a compressed layout.
+          grep -q 'COMPRESSED_FULL' inspect.txt
+
+      - name: Verify with the Linux kernel EROFS driver (best-effort)
+        run: |
+          echo "runner kernel: $(uname -r)"
+          sudo modprobe erofs 2>/dev/null || true
+          mkdir -p mnt
+          if sudo mount -t erofs -o loop test-zstd.img mnt; then
+            echo "mounted OK -- comparing contents against source tree"
+            rc=0
+            diff -r sample mnt || rc=$?
+            sudo umount mnt || true
+            exit $rc
+          else
+            echo "::notice::kernel mount unsupported on this runner (EROFS zstd needs Linux >= 6.10 with CONFIG_EROFS_FS_ZIP_ZSTD); skipping kernel verification"
+          fi

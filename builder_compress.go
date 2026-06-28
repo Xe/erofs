@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Xe/erofs/internal/ondisk"
+	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 )
 
@@ -15,6 +16,7 @@ type CompressionAlgorithm int
 const (
 	CompressionNone    CompressionAlgorithm = -1
 	CompressionAutoLZ4 CompressionAlgorithm = CompressionAlgorithm(ondisk.CompressionLZ4)
+	CompressionZstd    CompressionAlgorithm = CompressionAlgorithm(ondisk.CompressionZstd)
 )
 
 // WithCompression enables compression during image creation.
@@ -52,7 +54,7 @@ func isIncompressible(path string, size int64) bool {
 	return incompressibleExts[ext]
 }
 
-// tryCompressFile attempts to compress file data using LZ4.
+// tryCompressFile attempts to compress file data using the selected compression algorithm.
 // Returns the compressed lcluster data and the FULL index entries,
 // or nil if the file should remain uncompressed.
 func (b *Builder) tryCompressFile(ino *buildInode) (*compressedFileData, bool) {
@@ -64,6 +66,15 @@ func (b *Builder) tryCompressFile(ino *buildInode) (*compressedFileData, bool) {
 	}
 	// Don't compress very small files -- inline is better.
 	if ino.size <= int64(b.blockSize) {
+		return nil, false
+	}
+
+	// Only LZ4 and Zstandard are supported; anything else stores the file
+	// uncompressed rather than failing the build.
+	switch b.compression {
+	case CompressionAutoLZ4, CompressionZstd:
+		// supported
+	default:
 		return nil, false
 	}
 
@@ -83,10 +94,23 @@ func (b *Builder) tryCompressFile(ino *buildInode) (*compressedFileData, bool) {
 		}
 		chunk := data[start:end]
 
-		// Try LZ4 compression.
-		maxOut := lz4.CompressBlockBound(len(chunk))
-		compressed := make([]byte, maxOut)
-		n, err := lz4.CompressBlock(chunk, compressed, nil)
+		// Compress this lcluster using the selected algorithm.
+		var compressed []byte
+		var n int
+		var err error
+		switch b.compression {
+		case CompressionAutoLZ4:
+			maxOut := lz4.CompressBlockBound(len(chunk))
+			compressed = make([]byte, maxOut)
+			n, err = lz4.CompressBlock(chunk, compressed, nil)
+		case CompressionZstd:
+			enc, encErr := b.zstdEncoder()
+			if encErr != nil {
+				return nil, false
+			}
+			compressed = enc.EncodeAll(chunk, nil)
+			n = len(compressed)
+		}
 
 		if err != nil || n <= 0 || n >= len(chunk) {
 			// Compression didn't help -- store as PLAIN type.
@@ -180,9 +204,9 @@ func (b *Builder) writeCompressedInode(ino *buildInode, cdata *compressedFileDat
 	var mh [8]byte
 	// h_fragmentoff = 0 (no fragments)
 	// h_advise = 0 (no special flags)
-	// h_algorithmtype = LZ4 for HEAD1 (bits 0-3)
-	mh[6] = ondisk.CompressionLZ4 // h_algorithmtype
-	mh[7] = 0                     // h_clusterbits = 0 (lcluster = block_size)
+	// h_algorithmtype = selected algorithm for HEAD1 (bits 0-3)
+	mh[6] = b.comprAlgID() // h_algorithmtype (HEAD1)
+	mh[7] = 0              // h_clusterbits = 0 (lcluster = block_size)
 	if _, err := b.w.WriteAt(mh[:], mapHeaderOff); err != nil {
 		return err
 	}
@@ -227,4 +251,28 @@ func (b *Builder) writeCompressedBlocks(cdata *compressedFileData) error {
 		}
 	}
 	return nil
+}
+
+// zstdEncoder returns a reusable zstd encoder bound to the builder's block
+// size. The window is capped at the block size because every lcluster is
+// compressed independently into a single block (h_clusterbits = 0).
+func (b *Builder) zstdEncoder() (*zstd.Encoder, error) {
+	if b.zstdEnc != nil {
+		return b.zstdEnc, nil
+	}
+	window := b.blockSize
+	if window < 1024 { // zstd minimum window size
+		window = 1024
+	}
+	enc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedDefault),
+		zstd.WithWindowSize(window),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithEncoderCRC(false),
+	)
+	if err != nil {
+		return nil, err
+	}
+	b.zstdEnc = enc
+	return enc, nil
 }

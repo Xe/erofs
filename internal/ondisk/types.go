@@ -129,6 +129,16 @@ type LZ4Cfgs struct {
 	Reserved      [10]byte
 }
 
+// ZstdCfgs is the Zstandard compression configuration (32 bytes), matching
+// struct z_erofs_zstd_cfgs in erofs_fs.h. On disk it is preceded by a __le16
+// size field in the compression-config area that immediately follows the
+// superblock. WindowLog is the ZSTD window log minus ZSTD_WINDOWLOG_ABSOLUTEMIN.
+type ZstdCfgs struct {
+	Format    uint8
+	WindowLog uint8
+	Reserved  [30]byte
+}
+
 // HeadAlgorithm extracts the HEAD1 algorithm from h_algorithmtype.
 func (h *MapHeader) HeadAlgorithm() uint8 {
 	return h.AlgorithmType & 0x0F

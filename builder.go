@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Xe/erofs/internal/ondisk"
+	"github.com/klauspost/compress/zstd"
 )
 
 // Builder creates EROFS filesystem images.
@@ -28,6 +29,7 @@ type Builder struct {
 	compression     CompressionAlgorithm
 	compressEnabled bool
 	compressedData  map[*buildInode]*compressedFileData
+	zstdEnc         *zstd.Encoder
 	chunkBits       uint8               // 0 means chunk mode disabled
 	maxDeviceID     uint16              // highest device ID seen in AddChunkedFile
 	blobInfos       map[uint16]BlobInfo // device ID -> blob metadata
@@ -259,6 +261,13 @@ func (b *Builder) Build() error {
 	// Step 7: Write data blocks.
 	if err := b.writeDataBlocks(); err != nil {
 		return err
+	}
+
+	// Write the compression-config area (zstd only) BEFORE the superblock,
+	// because the superblock checksum covers the first block including this
+	// region.
+	if err := b.writeComprCfgs(); err != nil {
+		return fmt.Errorf("erofs: writing compr cfgs: %w", err)
 	}
 
 	// Step 8: Write superblock.
@@ -561,9 +570,10 @@ func (b *Builder) assignNIDs() {
 		return a.path < bI.path
 	})
 
-	// Start after the superblock region.
-	// Superblock ends at 1024 + 144 = 1168. Align to 32 = 1184.
-	sbEnd := int64(ondisk.SuperOffset) + 144
+	// Start after the superblock and, for zstd, the compression-config area.
+	// Superblock ends at SuperOffset + SuperBlockSize (1024 + 144 = 1168);
+	// cfgs (if any) follow it.
+	sbEnd := int64(ondisk.SuperOffset) + int64(ondisk.SuperBlockSize) + b.comprCfgsSize()
 	slotOff := alignUp(sbEnd, ondisk.ISlotSize)
 
 	for _, ino := range b.inodes {
@@ -943,6 +953,9 @@ func (b *Builder) computeIncompatFeatures() uint32 {
 	var flags uint32
 	if len(b.compressedData) > 0 {
 		flags |= ondisk.FeatureIncompatZeroPadding
+		if b.compression == CompressionZstd {
+			flags |= ondisk.FeatureIncompatComprCfgs
+		}
 	}
 	if b.chunkBits > 0 {
 		flags |= ondisk.FeatureIncompatChunkedFile
@@ -953,12 +966,63 @@ func (b *Builder) computeIncompatFeatures() uint32 {
 	return flags
 }
 
+// comprAlgID returns the on-disk compression algorithm id for the builder's
+// selected algorithm (e.g. ondisk.CompressionLZ4, ondisk.CompressionZstd).
+// Only valid for compressed inodes; it is never called when compression is
+// CompressionNone.
+func (b *Builder) comprAlgID() uint8 {
+	return uint8(b.compression)
+}
+
+// comprCfgsSize returns the number of bytes occupied by the compression-config
+// area that immediately follows the superblock. Only zstd needs it; the record
+// is a __le16 size (2 bytes) followed by a z_erofs_zstd_cfgs struct.
+func (b *Builder) comprCfgsSize() int64 {
+	if len(b.compressedData) == 0 || b.compression != CompressionZstd {
+		return 0
+	}
+	return 2 + int64(binary.Size(ondisk.ZstdCfgs{})) // __le16 size + struct
+}
+
+// writeComprCfgs writes the compression-config area for zstd images. The kernel
+// reads it from EROFS_SUPER_OFFSET + sizeof(superblock); this builder's
+// superblock is SuperBlockSize bytes, so the area starts at byte 1024+144.
+// Must be called before writeSuperblock, because the superblock checksum covers
+// this region.
+func (b *Builder) writeComprCfgs() error {
+	if b.comprCfgsSize() == 0 {
+		return nil
+	}
+	// The zstd window log equals the block-size bits for this builder
+	// (h_clusterbits = 0, so each extent decompresses to one block). The
+	// encoder floors the window at 1024 bytes, so clamp to zstd's minimum
+	// window log (ZSTD_WINDOWLOG_ABSOLUTEMIN = 10) to match and avoid underflow.
+	wbits := b.blkSzBits
+	if wbits < 10 {
+		wbits = 10
+	}
+	cfg := ondisk.ZstdCfgs{WindowLog: wbits - 10}
+
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.LittleEndian, uint16(binary.Size(cfg))); err != nil {
+		return err
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, &cfg); err != nil {
+		return err
+	}
+	off := int64(ondisk.SuperOffset) + int64(ondisk.SuperBlockSize)
+	if _, err := b.w.WriteAt(buf.Bytes(), off); err != nil {
+		return err
+	}
+	return nil
+}
+
 // computeComprAlgs returns the available compression algorithms bitmap.
 func (b *Builder) computeComprAlgs() uint16 {
 	if len(b.compressedData) == 0 {
 		return 0
 	}
-	return 1 << ondisk.CompressionLZ4
+	return 1 << b.comprAlgID()
 }
 
 // fileTypeFromMode converts fs.FileMode to an EROFS directory entry file type.

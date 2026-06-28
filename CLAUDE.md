@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Go implementation of EROFS (Enhanced Read-Only File System). Provides an `fs.FS` driver for reading EROFS images and a `Builder` for creating them. Supports LZ4, LZMA, DEFLATE, and Zstandard compression. Output is bytewise compatible with the Linux kernel EROFS driver and mkfs.erofs.
+Go implementation of EROFS (Enhanced Read-Only File System). Provides an `fs.FS` driver for reading EROFS images and a `Builder` for creating them. The reader supports LZ4, LZMA, DEFLATE, and Zstandard decompression; the builder emits LZ4 or Zstandard. Output is intended to be bytewise compatible with the Linux kernel EROFS driver and mkfs.erofs; the zstd compr_cfgs output has not yet been validated against erofs-utils >= 1.8 (the toolchain that first supports zstd — 1.7.1 does not).
 
 ## Commands
 

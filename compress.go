@@ -533,13 +533,10 @@ func zstdDecompress(src, dst []byte) (int, error) {
 	n, err := io.ReadFull(r, dst)
 	// The pcluster is zero-padded past the end of the zstd frame; once we
 	// have read the expected decompressed size we stop and ignore the rest.
-	if err == io.ErrUnexpectedEOF || err == io.EOF {
+	if err == io.ErrUnexpectedEOF {
 		return n, nil
 	}
-	if err != nil {
-		return n, err
-	}
-	return n, nil
+	return n, err
 }
 
 // deflateDecompress decompresses DEFLATE data.

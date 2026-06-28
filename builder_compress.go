@@ -2,7 +2,6 @@ package erofs
 
 import (
 	"encoding/binary"
-	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -55,7 +54,7 @@ func isIncompressible(path string, size int64) bool {
 	return incompressibleExts[ext]
 }
 
-// tryCompressFile attempts to compress file data using LZ4.
+// tryCompressFile attempts to compress file data using the selected compression algorithm.
 // Returns the compressed lcluster data and the FULL index entries,
 // or nil if the file should remain uncompressed.
 func (b *Builder) tryCompressFile(ino *buildInode) (*compressedFileData, bool) {
@@ -67,6 +66,15 @@ func (b *Builder) tryCompressFile(ino *buildInode) (*compressedFileData, bool) {
 	}
 	// Don't compress very small files -- inline is better.
 	if ino.size <= int64(b.blockSize) {
+		return nil, false
+	}
+
+	// Only LZ4 and Zstandard are supported; anything else stores the file
+	// uncompressed rather than failing the build.
+	switch b.compression {
+	case CompressionAutoLZ4, CompressionZstd:
+		// supported
+	default:
 		return nil, false
 	}
 
@@ -102,8 +110,6 @@ func (b *Builder) tryCompressFile(ino *buildInode) (*compressedFileData, bool) {
 			}
 			compressed = enc.EncodeAll(chunk, nil)
 			n = len(compressed)
-		default:
-			err = fmt.Errorf("erofs: unsupported compression algorithm %d", b.compression)
 		}
 
 		if err != nil || n <= 0 || n >= len(chunk) {
@@ -198,7 +204,7 @@ func (b *Builder) writeCompressedInode(ino *buildInode, cdata *compressedFileDat
 	var mh [8]byte
 	// h_fragmentoff = 0 (no fragments)
 	// h_advise = 0 (no special flags)
-	// h_algorithmtype = LZ4 for HEAD1 (bits 0-3)
+	// h_algorithmtype = selected algorithm for HEAD1 (bits 0-3)
 	mh[6] = b.comprAlgID() // h_algorithmtype (HEAD1)
 	mh[7] = 0              // h_clusterbits = 0 (lcluster = block_size)
 	if _, err := b.w.WriteAt(mh[:], mapHeaderOff); err != nil {

@@ -957,6 +957,8 @@ func (b *Builder) computeIncompatFeatures() uint32 {
 
 // comprAlgID returns the on-disk compression algorithm id for the builder's
 // selected algorithm (e.g. ondisk.CompressionLZ4, ondisk.CompressionZstd).
+// Only valid for compressed inodes; it is never called when compression is
+// CompressionNone.
 func (b *Builder) comprAlgID() uint8 {
 	return uint8(b.compression)
 }

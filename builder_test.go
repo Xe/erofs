@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io/fs"
+	"math/rand"
 	"testing"
 	"time"
 
@@ -482,6 +483,96 @@ func TestBuilderZstdRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(readBack, data) {
 		t.Fatalf("big.txt: content mismatch (got %d bytes, want %d)", len(readBack), len(data))
+	}
+}
+
+func TestBuilderZstdMixedContent(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	buf := newWriterAtBuffer(1 << 20)
+
+	b := NewBuilder(buf, WithBlockSize(12), WithEpoch(epoch), WithCompression(CompressionZstd))
+	b.AddDir("/", &staticFileInfo{name: "/", mode: fs.ModeDir | 0o755, mod: epoch})
+
+	// Highly compressible, spans several lclusters (all HEAD1).
+	compressible := bytes.Repeat([]byte("aaaaaaaaaaaaaaaa\n"), 2000)
+	// Low-entropy linear ramp: still compresses well, so it also becomes a
+	// fully-compressed inode. (It is NOT incompressible despite the name; it
+	// just provides a second multi-lcluster compressed file with different data.)
+	ramp := make([]byte, 9000)
+	for i := range ramp {
+		ramp[i] = byte((i*2654435761 + 1013904223) >> 13)
+	}
+	// Small file stays inline/uncompressed.
+	small := []byte("hi\n")
+
+	// Mixed file: alternating compressible and high-entropy blocks. The
+	// random blocks fail to compress and are stored as PLAIN lclusters
+	// within the same compressed inode as the HEAD1 (compressed) blocks.
+	rng := rand.New(rand.NewSource(1))
+	var mixedBuf bytes.Buffer
+	for blk := 0; blk < 6; blk++ {
+		if blk%2 == 0 {
+			mixedBuf.Write(bytes.Repeat([]byte("compressible block data\n"), 200)[:4096])
+		} else {
+			rb := make([]byte, 4096)
+			rng.Read(rb)
+			mixedBuf.Write(rb)
+		}
+	}
+	mixed := mixedBuf.Bytes()
+
+	files := map[string][]byte{
+		"/comp.txt":  compressible,
+		"/ramp.bin":  ramp,
+		"/small.txt": small,
+		"/mixed.bin": mixed,
+	}
+	for name, data := range files {
+		b.AddFile(name, &staticFileInfo{
+			name: name[1:], mode: 0o644, size: int64(len(data)), mod: epoch,
+		}, data)
+	}
+	if err := b.Build(); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// Verify the mixed file genuinely produced a compressed inode containing
+	// both HEAD1 (compressed) and PLAIN (stored) lclusters.
+	var mixedInode *buildInode
+	for ino := range b.compressedData {
+		if ino.path == "/mixed.bin" {
+			mixedInode = ino
+		}
+	}
+	if mixedInode == nil {
+		t.Fatal("mixed.bin was not stored as a compressed inode")
+	}
+	cdata := b.compressedData[mixedInode]
+	var head1, plain int
+	for _, e := range cdata.indexEntries {
+		switch e.Type() {
+		case ondisk.LClusterTypeHead1:
+			head1++
+		case ondisk.LClusterTypePlain:
+			plain++
+		}
+	}
+	if head1 == 0 || plain == 0 {
+		t.Fatalf("mixed.bin: want both HEAD1 and PLAIN lclusters, got head1=%d plain=%d", head1, plain)
+	}
+
+	fsys, err := Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for name, want := range files {
+		got, err := fs.ReadFile(fsys, name[1:])
+		if err != nil {
+			t.Fatalf("ReadFile(%s): %v", name, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s: content mismatch (got %d bytes, want %d)", name, len(got), len(want))
+		}
 	}
 }
 

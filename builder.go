@@ -955,6 +955,12 @@ func (b *Builder) computeIncompatFeatures() uint32 {
 	return flags
 }
 
+// comprAlgID returns the on-disk compression algorithm id for the builder's
+// selected algorithm (e.g. ondisk.CompressionLZ4, ondisk.CompressionZstd).
+func (b *Builder) comprAlgID() uint8 {
+	return uint8(b.compression)
+}
+
 // computeComprAlgs returns the available compression algorithms bitmap.
 func (b *Builder) computeComprAlgs() uint16 {
 	if len(b.compressedData) == 0 {

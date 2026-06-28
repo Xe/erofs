@@ -450,6 +450,38 @@ func TestBuilderCompression(t *testing.T) {
 	t.Logf("big.txt: %d bytes original, image size: %d bytes", len(data), len(buf.Bytes()))
 }
 
+func TestBuilderZstdRoundTrip(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	buf := newWriterAtBuffer(256 * 1024)
+
+	b := NewBuilder(buf, WithBlockSize(12), WithEpoch(epoch), WithCompression(CompressionZstd))
+	b.AddDir("/", &staticFileInfo{name: "/", mode: fs.ModeDir | 0o755, mod: epoch})
+
+	var bigContent bytes.Buffer
+	for range 500 {
+		bigContent.WriteString("This is a repeating line of text that should compress very well with zstd.\n")
+	}
+	data := bigContent.Bytes()
+	b.AddFile("/big.txt", &staticFileInfo{
+		name: "big.txt", mode: 0o644, size: int64(len(data)), mod: epoch,
+	}, data)
+
+	if err := b.Build(); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	fsys, err := Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	readBack, err := fs.ReadFile(fsys, "big.txt")
+	if err != nil {
+		t.Fatalf("ReadFile(big.txt): %v", err)
+	}
+	if !bytes.Equal(readBack, data) {
+		t.Fatalf("big.txt: content mismatch (got %d bytes, want %d)", len(readBack), len(data))
+	}
+}
+
 // staticFileInfo implements fs.FileInfo for testing.
 type staticFileInfo struct {
 	name string

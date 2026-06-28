@@ -2,6 +2,7 @@ package erofs
 
 import (
 	"encoding/binary"
+	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -85,10 +86,25 @@ func (b *Builder) tryCompressFile(ino *buildInode) (*compressedFileData, bool) {
 		}
 		chunk := data[start:end]
 
-		// Try LZ4 compression.
-		maxOut := lz4.CompressBlockBound(len(chunk))
-		compressed := make([]byte, maxOut)
-		n, err := lz4.CompressBlock(chunk, compressed, nil)
+		// Compress this lcluster using the selected algorithm.
+		var compressed []byte
+		var n int
+		var err error
+		switch b.compression {
+		case CompressionAutoLZ4:
+			maxOut := lz4.CompressBlockBound(len(chunk))
+			compressed = make([]byte, maxOut)
+			n, err = lz4.CompressBlock(chunk, compressed, nil)
+		case CompressionZstd:
+			enc, encErr := b.zstdEncoder()
+			if encErr != nil {
+				return nil, false
+			}
+			compressed = enc.EncodeAll(chunk, nil)
+			n = len(compressed)
+		default:
+			err = fmt.Errorf("erofs: unsupported compression algorithm %d", b.compression)
+		}
 
 		if err != nil || n <= 0 || n >= len(chunk) {
 			// Compression didn't help -- store as PLAIN type.
@@ -183,8 +199,8 @@ func (b *Builder) writeCompressedInode(ino *buildInode, cdata *compressedFileDat
 	// h_fragmentoff = 0 (no fragments)
 	// h_advise = 0 (no special flags)
 	// h_algorithmtype = LZ4 for HEAD1 (bits 0-3)
-	mh[6] = ondisk.CompressionLZ4 // h_algorithmtype
-	mh[7] = 0                     // h_clusterbits = 0 (lcluster = block_size)
+	mh[6] = b.comprAlgID() // h_algorithmtype (HEAD1)
+	mh[7] = 0              // h_clusterbits = 0 (lcluster = block_size)
 	if _, err := b.w.WriteAt(mh[:], mapHeaderOff); err != nil {
 		return err
 	}

@@ -1,3 +1,10 @@
+# [0.6.0](https://github.com/Xe/erofs/compare/v0.5.0...v0.6.0) (2026-06-28)
+
+
+### Features
+
+* pack compressed data into big pclusters ([#6](https://github.com/Xe/erofs/issues/6)) ([c162f34](https://github.com/Xe/erofs/commit/c162f3443b65f026604b376206d8222b8ed468fe)), closes [#5](https://github.com/Xe/erofs/issues/5)
+
 # [0.5.0](https://github.com/Xe/erofs/compare/v0.4.0...v0.5.0) (2026-06-28)
 
 

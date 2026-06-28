@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Xe/erofs/internal/ondisk"
+	"github.com/klauspost/compress/zstd"
 )
 
 // Builder creates EROFS filesystem images.
@@ -28,6 +29,7 @@ type Builder struct {
 	compression     CompressionAlgorithm
 	compressEnabled bool
 	compressedData  map[*buildInode]*compressedFileData
+	zstdEnc         *zstd.Encoder
 	chunkBits       uint8               // 0 means chunk mode disabled
 	maxDeviceID     uint16              // highest device ID seen in AddChunkedFile
 	blobInfos       map[uint16]BlobInfo // device ID -> blob metadata

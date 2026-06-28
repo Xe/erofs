@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Xe/erofs/internal/ondisk"
+	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 )
 
@@ -15,6 +16,7 @@ type CompressionAlgorithm int
 const (
 	CompressionNone    CompressionAlgorithm = -1
 	CompressionAutoLZ4 CompressionAlgorithm = CompressionAlgorithm(ondisk.CompressionLZ4)
+	CompressionZstd    CompressionAlgorithm = CompressionAlgorithm(ondisk.CompressionZstd)
 )
 
 // WithCompression enables compression during image creation.
@@ -227,4 +229,28 @@ func (b *Builder) writeCompressedBlocks(cdata *compressedFileData) error {
 		}
 	}
 	return nil
+}
+
+// zstdEncoder returns a reusable zstd encoder bound to the builder's block
+// size. The window is capped at the block size because every lcluster is
+// compressed independently into a single block (h_clusterbits = 0).
+func (b *Builder) zstdEncoder() (*zstd.Encoder, error) {
+	if b.zstdEnc != nil {
+		return b.zstdEnc, nil
+	}
+	window := b.blockSize
+	if window < 1024 { // zstd minimum window size
+		window = 1024
+	}
+	enc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedDefault),
+		zstd.WithWindowSize(window),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithEncoderCRC(false),
+	)
+	if err != nil {
+		return nil, err
+	}
+	b.zstdEnc = enc
+	return enc, nil
 }

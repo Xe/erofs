@@ -67,7 +67,8 @@ func main() {
 	}
 
 	if err := b.Build(); err != nil {
-		fmt.Fprintf(os.Stderr, "can't build filesystem: %v", err)
+		fmt.Fprintf(os.Stderr, "can't build filesystem: %v\n", err)
+		os.Exit(1)
 	}
 
 	fmt.Println("wrote to", *out)

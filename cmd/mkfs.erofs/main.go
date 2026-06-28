@@ -16,6 +16,8 @@ var (
 
 	dir = pflag.StringP("dir", "i", "", "directory to pack into EROFS")
 	out = pflag.StringP("out", "o", "", "resulting filesystem image name")
+
+	compression = pflag.StringP("compression", "z", "lz4", "compression algorithm: none, lz4, or zstd")
 )
 
 func main() {
@@ -39,12 +41,23 @@ func main() {
 	}
 	defer fout.Close()
 
-	b := erofs.NewBuilder(
-		fout,
+	opts := []erofs.BuildOption{
 		erofs.WithBlockSize(*blockSize),
 		erofs.WithEpoch(*epoch),
-		erofs.WithCompression(erofs.CompressionAutoLZ4),
-	)
+	}
+	switch *compression {
+	case "none":
+		// no compression option
+	case "lz4":
+		opts = append(opts, erofs.WithCompression(erofs.CompressionAutoLZ4))
+	case "zstd":
+		opts = append(opts, erofs.WithCompression(erofs.CompressionZstd))
+	default:
+		fmt.Fprintf(os.Stderr, "unknown compression %q (want none, lz4, or zstd)\n", *compression)
+		os.Exit(2)
+	}
+
+	b := erofs.NewBuilder(fout, opts...)
 
 	dirFS := os.DirFS(*dir)
 

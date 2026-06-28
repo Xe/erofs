@@ -8,6 +8,8 @@ package ondisk
 const (
 	SuperOffset = 1024
 	SuperMagic  = 0xE0F5E1E2
+	// SuperBlockSize is the on-disk size of SuperBlock in bytes.
+	SuperBlockSize = 144
 )
 
 // Inode slot size.

@@ -536,29 +536,17 @@ func TestBuilderZstdMixedContent(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	// Verify the mixed file genuinely produced a compressed inode containing
-	// both HEAD1 (compressed) and PLAIN (stored) lclusters.
-	var mixedInode *buildInode
+	// mixed.bin must still be stored as a compressed inode and round-trip.
+	// (Per-lcluster HEAD1/PLAIN mixing within one inode is exercised by
+	// TestBuilderBigPClusterMixed, which forces small pclusters.)
+	found := false
 	for ino := range b.compressedData {
 		if ino.path == "/mixed.bin" {
-			mixedInode = ino
+			found = true
 		}
 	}
-	if mixedInode == nil {
+	if !found {
 		t.Fatal("mixed.bin was not stored as a compressed inode")
-	}
-	cdata := b.compressedData[mixedInode]
-	var head1, plain int
-	for _, e := range cdata.indexEntries {
-		switch e.Type() {
-		case ondisk.LClusterTypeHead1:
-			head1++
-		case ondisk.LClusterTypePlain:
-			plain++
-		}
-	}
-	if head1 == 0 || plain == 0 {
-		t.Fatalf("mixed.bin: want both HEAD1 and PLAIN lclusters, got head1=%d plain=%d", head1, plain)
 	}
 
 	fsys, err := Open(bytes.NewReader(buf.Bytes()))
@@ -632,9 +620,9 @@ func TestBuilderZstdComprCfgs(t *testing.T) {
 	if format != 0 {
 		t.Fatalf("zstd cfgs format = %d, want 0", format)
 	}
-	// blkSzBits 12, window log 12, on-disk = 12 - 10 = 2.
-	if windowLog != 2 {
-		t.Fatalf("zstd cfgs windowlog = %d, want 2", windowLog)
+	// blkSzBits 12, default pcluster bits 16, on-disk = 16 - 10 = 6.
+	if windowLog != 6 {
+		t.Fatalf("zstd cfgs windowlog = %d, want 6", windowLog)
 	}
 
 	// The image must still read back correctly with the shifted metadata
@@ -678,9 +666,9 @@ func TestBuilderZstdComprCfgsBlockSize(t *testing.T) {
 	if size := binary.LittleEndian.Uint16(img[off:]); size != 32 {
 		t.Fatalf("zstd cfgs size = %d, want 32", size)
 	}
-	// windowlog on disk = blkSzBits - ZSTD_WINDOWLOG_ABSOLUTEMIN(10) = 4.
-	if windowLog := img[off+3]; windowLog != blkSzBits-10 {
-		t.Fatalf("zstd cfgs windowlog = %d, want %d", windowLog, blkSzBits-10)
+	// pcluster bits = blkSzBits+4 = 18; windowlog on disk = 18 - 10 = 8.
+	if windowLog := img[off+3]; windowLog != blkSzBits-10+4 {
+		t.Fatalf("zstd cfgs windowlog = %d, want %d", windowLog, blkSzBits-10+4)
 	}
 
 	fsys, err := Open(bytes.NewReader(img))

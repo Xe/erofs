@@ -29,10 +29,16 @@ func WithCompression(alg CompressionAlgorithm) BuildOption {
 	}
 }
 
-// compressedBlock holds the result of compressing one lcluster.
-type compressedBlock struct {
-	data       []byte
-	compressed bool // true if actually compressed, false if stored plain
+// WithCompressionLevel sets the compression level; higher is smaller but
+// slower. For Zstandard it is a numeric level (1..22, as in `zstd -N`), mapped
+// to the nearest level the encoder supports. For LZ4 any level > 0 switches the
+// builder to the high-compression encoder (lz4hc), with the level clamped to
+// lz4's 1..9 search depth. It only affects encoding, so it does not change
+// on-disk compatibility. A level of 0 keeps the algorithm's default.
+func WithCompressionLevel(level int) BuildOption {
+	return func(b *Builder) {
+		b.compressionLevel = level
+	}
 }
 
 // incompressibleExts is a set of file extensions known to be already compressed.
@@ -79,80 +85,164 @@ func (b *Builder) tryCompressFile(ino *buildInode) (*compressedFileData, bool) {
 	}
 
 	data := ino.data
-	lclusterSize := b.blockSize // h_clusterbits = 0
-	totalLclusters := (len(data) + lclusterSize - 1) / lclusterSize
+	bs := b.blockSize
+	size := len(data)
+	K := b.pclusterLclustersEff() // logical lclusters per pcluster (>= 2)
+	tail := size % bs             // partial-tail bytes (0 if block-aligned)
+	totalLclusters := (size + bs - 1) / bs
 
-	var pclusters [][]byte
-	var indexEntries []ondisk.LClusterIndex
-	anyCompressed := false
+	var (
+		blocks  [][]byte
+		entries []ondisk.LClusterIndex
+		blockOf []int
+		anyBig  bool
+	)
 
-	for i := range totalLclusters {
-		start := i * lclusterSize
-		end := start + lclusterSize
-		if end > len(data) {
-			end = len(data)
+	lcn := 0
+	for lcn < totalLclusters {
+		groupEnd := lcn + K
+		if groupEnd >= totalLclusters {
+			groupEnd = totalLclusters
+		} else if groupEnd == totalLclusters-1 && tail != 0 {
+			// Absorb a lone trailing partial lcluster into this group so it
+			// never forms its own 1-lcluster group.
+			groupEnd = totalLclusters
 		}
-		chunk := data[start:end]
+		spanLcl := groupEnd - lcn
+		g0 := lcn * bs
+		g1 := groupEnd * bs
+		if g1 > size {
+			g1 = size // final group includes the partial tail
+		}
+		group := data[g0:g1]
 
-		// Compress this lcluster using the selected algorithm.
-		var compressed []byte
-		var n int
-		var err error
-		switch b.compression {
-		case CompressionAutoLZ4:
-			maxOut := lz4.CompressBlockBound(len(chunk))
-			compressed = make([]byte, maxOut)
-			n, err = lz4.CompressBlock(chunk, compressed, nil)
-		case CompressionZstd:
-			enc, encErr := b.zstdEncoder()
-			if encErr != nil {
-				return nil, false
+		comp, ok := b.compressGroup(group)
+		cBlocks := 0
+		if ok {
+			cBlocks = (len(comp) + bs - 1) / bs
+		}
+
+		if ok && cBlocks > 0 && cBlocks < spanLcl {
+			// Big pcluster: dense compressed blocks + HEAD/NONHEAD index.
+			// EROFS 0-padding: the compressed stream is right-aligned within
+			// its physical blocks (leading zero padding). Readers locate the
+			// stream by skipping leading zeros, so the remaining length is the
+			// exact compressed size -- which liblz4's partial decode requires.
+			headBlock := len(blocks)
+			packed := make([]byte, cBlocks*bs)
+			copy(packed[len(packed)-len(comp):], comp)
+			for i := range cBlocks {
+				blocks = append(blocks, packed[i*bs:(i+1)*bs])
 			}
-			compressed = enc.EncodeAll(chunk, nil)
-			n = len(compressed)
-		}
-
-		if err != nil || n <= 0 || n >= len(chunk) {
-			// Compression didn't help -- store as PLAIN type.
-			// Pad to block size.
-			pcluster := make([]byte, b.blockSize)
-			copy(pcluster, chunk)
-			pclusters = append(pclusters, pcluster)
-			indexEntries = append(indexEntries, ondisk.LClusterIndex{
-				Advise:     ondisk.LClusterTypePlain,
-				ClusterOfs: 0,
-				Union:      0, // blkaddr filled later
-			})
+			lastLcn := groupEnd - 1
+			tailMarker := groupEnd == totalLclusters && tail != 0
+			for j := range spanLcl {
+				cur := lcn + j
+				switch {
+				case j == 0:
+					entries = append(entries, ondisk.LClusterIndex{
+						Advise: ondisk.LClusterTypeHead1, ClusterOfs: 0,
+						Union: uint32(headBlock),
+					})
+					blockOf = append(blockOf, headBlock)
+				case tailMarker && cur == lastLcn:
+					// Partial-tail boundary marker (owns no data block).
+					entries = append(entries, ondisk.LClusterIndex{
+						Advise: ondisk.LClusterTypePlain, ClusterOfs: uint16(tail),
+						Union: 0,
+					})
+					blockOf = append(blockOf, -1)
+				default:
+					var d0 uint16
+					if j == 1 {
+						d0 = uint16(cBlocks) | uint16(ondisk.LID0CBlkCnt)
+					} else {
+						d0 = uint16(j)
+					}
+					d1 := uint16(lastLcn - cur)
+					entries = append(entries, ondisk.LClusterIndex{
+						Advise: ondisk.LClusterTypeNonHead, ClusterOfs: 0,
+						Union: uint32(d0) | uint32(d1)<<16,
+					})
+					blockOf = append(blockOf, -1)
+				}
+			}
+			anyBig = true
 		} else {
-			// Compression worked. Pad compressed data to block size.
-			pcluster := make([]byte, b.blockSize)
-			copy(pcluster, compressed[:n])
-			pclusters = append(pclusters, pcluster)
-			indexEntries = append(indexEntries, ondisk.LClusterIndex{
-				Advise:     ondisk.LClusterTypeHead1,
-				ClusterOfs: 0,
-				Union:      0, // blkaddr filled later
-			})
-			anyCompressed = true
+			// Incompressible group: store each lcluster as its own PLAIN block.
+			for j := range spanLcl {
+				cur := lcn + j
+				s := cur * bs
+				e := s + bs
+				if e > size {
+					e = size
+				}
+				blk := make([]byte, bs)
+				copy(blk, data[s:e])
+				lb := len(blocks)
+				blocks = append(blocks, blk)
+				entries = append(entries, ondisk.LClusterIndex{
+					Advise: ondisk.LClusterTypePlain, ClusterOfs: 0,
+					Union: uint32(lb),
+				})
+				blockOf = append(blockOf, lb)
+			}
 		}
+		lcn = groupEnd
 	}
 
-	if !anyCompressed {
-		// Nothing compressed at all -- don't bother with compressed layout.
+	if !anyBig {
+		// Nothing benefited from a big pcluster -- store flat instead.
 		return nil, false
 	}
 
 	return &compressedFileData{
-		pclusters:    pclusters,
-		indexEntries: indexEntries,
-		lclusterSize: lclusterSize,
+		blocks:       blocks,
+		indexEntries: entries,
+		blockOf:      blockOf,
+		lclusterSize: bs,
 	}, true
 }
 
+// compressGroup compresses one pcluster's worth of bytes as a single unit.
+// Returns (compressed, true) when compression produced output; (nil, false)
+// when the data is incompressible (LZ4 reports no gain).
+func (b *Builder) compressGroup(group []byte) ([]byte, bool) {
+	switch b.compression {
+	case CompressionAutoLZ4:
+		dst := make([]byte, lz4.CompressBlockBound(len(group)))
+		var n int
+		var err error
+		if b.compressionLevel > 0 {
+			n, err = b.lz4HCCompressor().CompressBlock(group, dst)
+		} else {
+			n, err = lz4.CompressBlock(group, dst, nil)
+		}
+		if err != nil || n <= 0 {
+			return nil, false
+		}
+		return dst[:n], true
+	case CompressionZstd:
+		enc, err := b.zstdEncoder()
+		if err != nil {
+			return nil, false
+		}
+		return enc.EncodeAll(group, nil), true
+	default:
+		return nil, false
+	}
+}
+
 // compressedFileData holds the compression results for a single file.
+//
+// blocks is the dense, ordered list of physical blocks (each blockSize bytes)
+// the inode occupies. indexEntries has one entry per logical lcluster. blockOf
+// maps each index entry to its local block index within blocks, or -1 for
+// entries that own no block (NONHEAD continuations and partial-tail markers).
 type compressedFileData struct {
-	pclusters    [][]byte
+	blocks       [][]byte
 	indexEntries []ondisk.LClusterIndex
+	blockOf      []int
 	lclusterSize int
 }
 
@@ -169,13 +259,13 @@ func (b *Builder) writeCompressedInode(ino *buildInode, cdata *compressedFileDat
 		Format:    uint16(ondisk.InodeLayoutExtended) | uint16(ondisk.InodeCompressedFull)<<ondisk.IDataLayoutBit,
 		Mode:      erofsModeFromFS(ino.mode),
 		Size:      uint64(ino.size),
-		U:         uint32(len(cdata.pclusters)), // blocks_lo = total compressed blocks
+		U:         uint32(len(cdata.blocks)), // blocks_lo = total physical blocks
 		UID:       ino.uid,
 		GID:       ino.gid,
 		Mtime:     ino.mtime.Unix() - b.epoch,
 		MtimeNsec: uint32(ino.mtime.Nanosecond()),
 		NLink:     1,
-		NB:        1,
+		NB:        0, // extended inode: offset-6 is startblk_hi/blocks_hi, not nlink
 	}
 	ei.Ino = uint32(ino.nid)
 
@@ -201,12 +291,18 @@ func (b *Builder) writeCompressedInode(ino *buildInode, cdata *compressedFileDat
 
 	// Write map header at ALIGN(metaEnd, 8) = metaOff + 64 (already aligned).
 	mapHeaderOff := ino.metaOff + 64
+	// h_advise: mark BIG_PCLUSTER_1 when any pcluster spans multiple lclusters.
+	var advise uint16
+	for _, e := range cdata.indexEntries {
+		if e.Type() == ondisk.LClusterTypeNonHead {
+			advise |= ondisk.AdviseBigPCluster1
+			break
+		}
+	}
 	var mh [8]byte
-	// h_fragmentoff = 0 (no fragments)
-	// h_advise = 0 (no special flags)
-	// h_algorithmtype = selected algorithm for HEAD1 (bits 0-3)
-	mh[6] = b.comprAlgID() // h_algorithmtype (HEAD1)
-	mh[7] = 0              // h_clusterbits = 0 (lcluster = block_size)
+	binary.LittleEndian.PutUint16(mh[4:], advise) // h_advise
+	mh[6] = b.comprAlgID()                        // h_algorithmtype (HEAD1)
+	mh[7] = 0                                     // h_clusterbits = 0 (lcluster == block)
 	if _, err := b.w.WriteAt(mh[:], mapHeaderOff); err != nil {
 		return err
 	}
@@ -232,40 +328,73 @@ func (b *Builder) writeCompressedInode(ino *buildInode, cdata *compressedFileDat
 	return nil
 }
 
-// layoutCompressedBlocks assigns block addresses to compressed pclusters and
-// updates the index entries with the correct blkaddr values.
+// layoutCompressedBlocks assigns absolute block addresses to the inode's dense
+// block list and rewrites blkaddr in block-owning index entries (HEAD/PLAIN).
+// NONHEAD entries keep their delta encoding; tail markers keep blkaddr 0.
 func (b *Builder) layoutCompressedBlocks(ino *buildInode, cdata *compressedFileData, startBlk *int64) {
+	base := *startBlk
 	for i := range cdata.indexEntries {
-		cdata.indexEntries[i].Union = uint32(*startBlk)
-		*startBlk++
+		if cdata.blockOf[i] >= 0 {
+			cdata.indexEntries[i].Union = uint32(base + int64(cdata.blockOf[i]))
+		}
 	}
-	ino.startBlk = uint64(cdata.indexEntries[0].Union)
+	ino.startBlk = uint64(base)
+	*startBlk += int64(len(cdata.blocks))
 }
 
-// writeCompressedBlocks writes the pcluster data to disk.
-func (b *Builder) writeCompressedBlocks(cdata *compressedFileData) error {
-	for i, entry := range cdata.indexEntries {
-		off := int64(entry.Union) * int64(b.blockSize)
-		if _, err := b.w.WriteAt(cdata.pclusters[i], off); err != nil {
+// writeCompressedBlocks writes the inode's dense block list contiguously
+// starting at ino.startBlk.
+func (b *Builder) writeCompressedBlocks(ino *buildInode, cdata *compressedFileData) error {
+	for i, blk := range cdata.blocks {
+		off := (int64(ino.startBlk) + int64(i)) * int64(b.blockSize)
+		if _, err := b.w.WriteAt(blk, off); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// zstdEncoder returns a reusable zstd encoder bound to the builder's block
-// size. The window is capped at the block size because every lcluster is
-// compressed independently into a single block (h_clusterbits = 0).
+// lz4HCCompressor returns a reusable high-compression LZ4 compressor whose
+// search depth tracks the requested compression level, clamped to lz4's 1..9
+// range. The HC encoder produces standard LZ4 blocks, so it does not change
+// on-disk compatibility.
+func (b *Builder) lz4HCCompressor() *lz4.CompressorHC {
+	if b.lz4HC != nil {
+		return b.lz4HC
+	}
+	depth := b.compressionLevel
+	if depth < 1 {
+		depth = 1
+	}
+	if depth > 9 {
+		depth = 9
+	}
+	// lz4.Level1..Level9 are defined as 1 << (8 + n).
+	b.lz4HC = &lz4.CompressorHC{Level: lz4.CompressionLevel(1 << (8 + depth))}
+	return b.lz4HC
+}
+
+// zstdEncoder returns a reusable zstd encoder whose window tracks the pcluster
+// size, so back-references can span the whole compression unit (a big pcluster
+// covering several lclusters).
 func (b *Builder) zstdEncoder() (*zstd.Encoder, error) {
 	if b.zstdEnc != nil {
 		return b.zstdEnc, nil
 	}
-	window := b.blockSize
+	window := b.pclusterSizeEff()
 	if window < 1024 { // zstd minimum window size
 		window = 1024
 	}
+	level := zstd.SpeedDefault
+	if b.compressionLevel != 0 {
+		// Map a numeric zstd level (1..22, as in `zstd -N`) to klauspost's
+		// nearest encoder level. The level affects only the encoder; the frame
+		// stays within the advertised window, so it does not change on-disk
+		// compatibility.
+		level = zstd.EncoderLevelFromZstd(b.compressionLevel)
+	}
 	enc, err := zstd.NewWriter(nil,
-		zstd.WithEncoderLevel(zstd.SpeedDefault),
+		zstd.WithEncoderLevel(level),
 		zstd.WithWindowSize(window),
 		zstd.WithEncoderConcurrency(1),
 		zstd.WithEncoderCRC(false),

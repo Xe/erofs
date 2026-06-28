@@ -18,6 +18,7 @@ var (
 	out = pflag.StringP("out", "o", "", "resulting filesystem image name")
 
 	compression = pflag.StringP("compression", "z", "lz4", "compression algorithm: none, lz4, or zstd")
+	level       = pflag.IntP("level", "L", 0, "zstd compression level (1..22, higher is smaller/slower; 0 = default)")
 )
 
 func main() {
@@ -55,6 +56,9 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "unknown compression %q (want none, lz4, or zstd)\n", *compression)
 		os.Exit(2)
+	}
+	if *level != 0 {
+		opts = append(opts, erofs.WithCompressionLevel(*level))
 	}
 
 	b := erofs.NewBuilder(fout, opts...)

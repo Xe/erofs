@@ -125,14 +125,23 @@ func (f *FS) readInodeAt(nid uint64, iloc int64) (*inode, error) {
 
 // parseUnion interprets the i_u and i_nb union fields based on the data layout.
 func (ino *inode) parseUnion(u uint32, nb uint16, format uint16, blkSzBits uint8) {
+	// In the extended inode (version bit set) the field at offset 6 is the
+	// high bits of the block address (startblk_hi/blocks_hi); nlink lives in
+	// i_nlink (offset 44) and has already been set by the caller. In the
+	// compact inode, offset 6 carries nlink (optionally reused as startblk_hi
+	// via the NLINK_1 bit).
+	extended := format&ondisk.IVersionMask != 0
+
 	switch ino.dataLayout {
 	case ondisk.InodeFlatPlain, ondisk.InodeFlatInline:
 		ino.startBlk = uint64(u)
-		// If NLINK_1 bit is set and not a directory, i_nb is startblk_hi.
-		if format&(1<<ondisk.INLink1Bit) != 0 && !ino.isDir() {
+		switch {
+		case extended:
+			ino.startBlk |= uint64(nb) << 32
+		case format&(1<<ondisk.INLink1Bit) != 0 && !ino.isDir():
 			ino.startBlk |= uint64(nb) << 32
 			ino.nlink = 1
-		} else {
+		default:
 			ino.nlink = uint32(nb)
 		}
 
@@ -142,7 +151,9 @@ func (ino *inode) parseUnion(u uint32, nb uint16, format uint16, blkSzBits uint8
 	case ondisk.InodeChunkBased:
 		ino.chunkFormat = uint16(u & 0xFFFF)
 		ino.chunkBits = blkSzBits + uint8(ino.chunkFormat&ondisk.ChunkFormatBlkBitsMask)
-		ino.nlink = uint32(nb)
+		if !extended {
+			ino.nlink = uint32(nb)
+		}
 	}
 }
 

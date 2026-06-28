@@ -166,10 +166,28 @@ func (cf *compressedFile) loadPClusterFull(la int64) error {
 		return err
 	}
 
+	// A PLAIN lcluster carrying a non-zero clusterofs (in a non-interlaced
+	// image) is a big-pcluster tail boundary marker: its bytes belong to the
+	// preceding pcluster's extent. Resolve the offset there instead.
+	if entry.Type() == ondisk.LClusterTypePlain && entry.ClusterOfs != 0 &&
+		cf.mapHeader.Advise&ondisk.AdviseInterlacedPCluster == 0 && lcn > 0 {
+		lcn--
+		entry, err = cf.readLClusterEntry(indexStart, lcn)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Follow NONHEAD delta chain to find HEAD.
 	headLcn := lcn
 	for entry.Type() == ondisk.LClusterTypeNonHead {
 		delta := int64(entry.Delta0())
+		// On the first NONHEAD of a big pcluster, delta[0] carries the
+		// compressed block count tagged with D0_CBLKCNT; the real backward
+		// distance to the head is 1.
+		if delta&ondisk.LID0CBlkCnt != 0 {
+			delta = 1
+		}
 		if delta == 0 {
 			return fmt.Errorf("erofs: zero delta in NONHEAD chain at lcn=%d", headLcn)
 		}
@@ -208,13 +226,15 @@ func (cf *compressedFile) loadPClusterFull(la int64) error {
 
 	if nextLcn < totalLclusters {
 		nextEntry, err := cf.readLClusterEntry(indexStart, nextLcn)
-		if err == nil && nextEntry.Type() == ondisk.LClusterTypeNonHead {
-			if nextEntry.Advise&ondisk.LID0CBlkCnt != 0 {
-				pclusterBlocks = int64(nextEntry.Delta0() & ^uint16(ondisk.LID0CBlkCnt>>0))
-				// D0_CBLKCNT is bit 11, so mask it off from delta0.
-				pclusterBlocks = int64(nextEntry.Delta0()) & ((1 << 11) - 1)
-			}
+		if err == nil && nextEntry.Type() == ondisk.LClusterTypeNonHead &&
+			nextEntry.Delta0()&ondisk.LID0CBlkCnt != 0 {
+			// D0_CBLKCNT (bit 11) of the first NONHEAD's delta[0] carries the
+			// pcluster's compressed block count.
+			pclusterBlocks = int64(nextEntry.Delta0() &^ uint16(ondisk.LID0CBlkCnt))
 		}
+	}
+	if pclusterBlocks < 1 {
+		pclusterBlocks = 1
 	}
 
 	pclusterSize := pclusterBlocks * blockSize
@@ -230,7 +250,10 @@ func (cf *compressedFile) loadPClusterFull(la int64) error {
 			break
 		}
 		if scanEntry.Type() != ondisk.LClusterTypeNonHead {
-			extentEnd = scanLcn * cf.lclustSz
+			// The next non-NONHEAD entry marks the end of this extent; its
+			// clusterofs is how far the extent reaches into that lcluster
+			// (non-zero for a partial-tail boundary marker).
+			extentEnd = scanLcn*cf.lclustSz + int64(scanEntry.ClusterOfs)
 			break
 		}
 	}
@@ -267,6 +290,14 @@ func (cf *compressedFile) loadPClusterFull(la int64) error {
 			copy(decompressed, compressed[clusterOfs:])
 		}
 	} else {
+		// EROFS 0-padding: the compressed stream is right-aligned within its
+		// physical blocks. Skip leading zero padding so the decoder sees the
+		// stream start (the LZ4 token / zstd magic, never zero) and the exact
+		// remaining length. (Older left-aligned images have no leading zeros,
+		// so this is a no-op for them; lz4Decompress trims any trailing pad.)
+		for len(compressed) > 0 && compressed[0] == 0 {
+			compressed = compressed[1:]
+		}
 		switch algID {
 		case ondisk.CompressionLZ4:
 			dn, err := lz4Decompress(compressed, decompressed)

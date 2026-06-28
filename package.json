@@ -16,7 +16,10 @@
   "main": "index.js",
   "scripts": {
     "test": "go test ./...",
-    "prepare": "husky"
+    "prepare": "husky",
+    "ci": "npm run ci:go && npm run ci:zstd",
+    "ci:go": "act -P ubuntu-24.04=ghcr.io/catthehacker/ubuntu:act-24.04 -j go_build --matrix os:ubuntu-24.04 --matrix go_version:stable",
+    "ci:zstd": "act -P ubuntu-24.04=ghcr.io/catthehacker/ubuntu:act-24.04 -j zstd_image --container-options \"--privileged\""
   },
   "lint-staged": {
     "*.go": "go tool goimports -w"
@@ -34,7 +37,9 @@
     "semantic-release": "^25.0.3"
   },
   "release": {
-    "branches": ["main"],
+    "branches": [
+      "main"
+    ],
     "plugins": [
       "@semantic-release/commit-analyzer",
       "@semantic-release/release-notes-generator",
@@ -43,7 +48,11 @@
       [
         "@semantic-release/git",
         {
-          "assets": ["CHANGELOG.md", "package.json", "package-lock.json"],
+          "assets": [
+            "CHANGELOG.md",
+            "package.json",
+            "package-lock.json"
+          ],
           "message": "chore(release): ${nextRelease.version}\n\n${nextRelease.notes}"
         }
       ]

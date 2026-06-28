@@ -1,3 +1,10 @@
+# [0.5.0](https://github.com/Xe/erofs/compare/v0.4.0...v0.5.0) (2026-06-28)
+
+
+### Features
+
+* add Zstandard compression support to the builder ([#4](https://github.com/Xe/erofs/issues/4)) ([8f84bb0](https://github.com/Xe/erofs/commit/8f84bb07549d56a4047e11313f342400ee3520b7))
+
 # [0.4.0](https://github.com/Xe/erofs/compare/v0.3.0...v0.4.0) (2026-04-04)
 
 

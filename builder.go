@@ -968,7 +968,7 @@ func (b *Builder) computeComprAlgs() uint16 {
 	if len(b.compressedData) == 0 {
 		return 0
 	}
-	return 1 << ondisk.CompressionLZ4
+	return 1 << b.comprAlgID()
 }
 
 // fileTypeFromMode converts fs.FileMode to an EROFS directory entry file type.

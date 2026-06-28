@@ -2,10 +2,13 @@ package erofs
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io/fs"
 	"testing"
 	"time"
+
+	"github.com/Xe/erofs/internal/ondisk"
 )
 
 // writerAtBuffer wraps a byte slice to implement io.WriterAt and io.ReaderAt.
@@ -479,6 +482,30 @@ func TestBuilderZstdRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(readBack, data) {
 		t.Fatalf("big.txt: content mismatch (got %d bytes, want %d)", len(readBack), len(data))
+	}
+}
+
+func TestBuilderZstdAvailComprAlgs(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	buf := newWriterAtBuffer(256 * 1024)
+
+	b := NewBuilder(buf, WithBlockSize(12), WithEpoch(epoch), WithCompression(CompressionZstd))
+	b.AddDir("/", &staticFileInfo{name: "/", mode: fs.ModeDir | 0o755, mod: epoch})
+	data := bytes.Repeat([]byte("compress me with zstd please\n"), 500)
+	b.AddFile("/big.txt", &staticFileInfo{
+		name: "big.txt", mode: 0o644, size: int64(len(data)), mod: epoch,
+	}, data)
+	if err := b.Build(); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	img := buf.Bytes()
+	// available_compr_algs is a __le16 at superblock offset 84
+	// (superblock starts at byte 1024).
+	got := binary.LittleEndian.Uint16(img[1024+84:])
+	want := uint16(1) << ondisk.CompressionZstd
+	if got != want {
+		t.Fatalf("available_compr_algs = 0x%04x, want 0x%04x", got, want)
 	}
 }
 

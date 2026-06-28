@@ -14,26 +14,31 @@ import (
 
 	"github.com/Xe/erofs/internal/ondisk"
 	"github.com/klauspost/compress/zstd"
+	"github.com/pierrec/lz4/v4"
 )
 
 // Builder creates EROFS filesystem images.
 type Builder struct {
-	w               io.WriterAt
-	blockSize       int
-	blkSzBits       uint8
-	inodes          []*buildInode
-	dirs            map[string]*buildDir
-	nextNID         uint64
-	metaBlkAddr     uint32
-	epoch           int64
-	compression     CompressionAlgorithm
-	compressEnabled bool
-	compressedData  map[*buildInode]*compressedFileData
-	zstdEnc         *zstd.Encoder
-	chunkBits       uint8               // 0 means chunk mode disabled
-	maxDeviceID     uint16              // highest device ID seen in AddChunkedFile
-	blobInfos       map[uint16]BlobInfo // device ID -> blob metadata
-	flatDev         bool                // flat device mode: compute UniAddr for each device
+	w                io.WriterAt
+	blockSize        int
+	blkSzBits        uint8
+	pclusterBits     uint8 // log2 of pcluster size; 0 = auto (blkSzBits+4)
+	inodes           []*buildInode
+	dirs             map[string]*buildDir
+	nextNID          uint64
+	metaBlkAddr      uint32
+	epoch            int64
+	compression      CompressionAlgorithm
+	compressEnabled  bool
+	compressedData   map[*buildInode]*compressedFileData
+	zstdEnc          *zstd.Encoder
+	lz4HC            *lz4.CompressorHC
+	compressionLevel int                 // numeric level (zstd 1..22 / lz4 1..9); 0 = default
+	chunkBits        uint8               // 0 means chunk mode disabled
+	maxDeviceID      uint16              // highest device ID seen in AddChunkedFile
+	blobInfos        map[uint16]BlobInfo // device ID -> blob metadata
+	flatDev          bool                // flat device mode: compute UniAddr for each device
+	endDataBlk       int64               // first block past all out-of-line data (for BlocksLo)
 }
 
 type buildInode struct {
@@ -73,6 +78,39 @@ func WithBlockSize(bits uint8) BuildOption {
 		b.blockSize = 1 << bits
 	}
 }
+
+// WithPClusterSize sets the pcluster (compression unit) size as a power-of-two
+// bit count, e.g. 16 for 64 KiB. One pcluster spans pclusterSize/blockSize
+// logical lclusters and is compressed as a single unit, so its compressed
+// output can occupy fewer physical blocks than its logical span (a "big
+// pcluster"). Defaults to blockSize*16, floored at 2 lclusters and capped at
+// 1 MiB.
+func WithPClusterSize(bits uint8) BuildOption {
+	return func(b *Builder) {
+		b.pclusterBits = bits
+	}
+}
+
+// pclusterBitsEff returns the effective pcluster size in bits, applying the
+// auto default and clamping. A pcluster must span at least two lclusters for a
+// big pcluster to be possible, and is capped at 1 MiB (Z_EROFS_PCLUSTER_MAX).
+func (b *Builder) pclusterBitsEff() uint8 {
+	pb := b.pclusterBits
+	if pb == 0 {
+		pb = b.blkSzBits + 4 // 16 lclusters
+	}
+	if pb < b.blkSzBits+1 {
+		pb = b.blkSzBits + 1
+	}
+	if pb > 20 {
+		pb = 20
+	}
+	return pb
+}
+
+func (b *Builder) pclusterSizeEff() int { return 1 << b.pclusterBitsEff() }
+
+func (b *Builder) pclusterLclustersEff() int { return b.pclusterSizeEff() / b.blockSize }
 
 // WithEpoch sets the filesystem epoch timestamp.
 func WithEpoch(t time.Time) BuildOption {
@@ -576,9 +614,24 @@ func (b *Builder) assignNIDs() {
 	sbEnd := int64(ondisk.SuperOffset) + int64(ondisk.SuperBlockSize) + b.comprCfgsSize()
 	slotOff := alignUp(sbEnd, ondisk.ISlotSize)
 
+	blockSize := int64(b.blockSize)
 	for _, ino := range b.inodes {
 		// Align to slot boundary.
 		slotOff = alignUp(slotOff, ondisk.ISlotSize)
+
+		// EROFS forbids an inode's fixed header -- and, for FLAT_INLINE, its
+		// inline tail data -- from crossing a block boundary. The 64-byte
+		// header must stay within one block; an inline tail (written right
+		// after the header) must too. Trailing compressed/chunk indexes may
+		// cross blocks, so only the header is constrained for them. If the
+		// constrained region would straddle a boundary, pad to the next block.
+		noCross := int64(64)
+		if ino.dataLayout == ondisk.InodeFlatInline {
+			noCross = int64(ino.metaSize) // header + inline tail
+		}
+		if slotOff/blockSize != (slotOff+noCross-1)/blockSize {
+			slotOff = alignUp(slotOff, blockSize)
+		}
 
 		ino.nid = uint64(slotOff) >> ondisk.ISlotBits
 		ino.metaOff = slotOff
@@ -678,6 +731,12 @@ func (b *Builder) layoutDataBlocks() {
 			currentBlk += numBlocks
 		}
 	}
+
+	// Record the first block past all out-of-line data so the superblock can
+	// report the correct image size. This covers every layout (FLAT_PLAIN,
+	// FLAT_INLINE preceding blocks, and compressed pclusters); the old maxOff
+	// loop only counted FLAT_PLAIN, undercounting BlocksLo for everything else.
+	b.endDataBlk = currentBlk
 }
 
 // writeMetadata writes inode metadata (extended inodes + inline tails).
@@ -713,7 +772,11 @@ func (b *Builder) writeInode(ino *buildInode) error {
 		MtimeNsec: uint32(ino.mtime.Nanosecond()),
 	}
 
-	// Set nlink.
+	// Set nlink. In the extended inode, nlink lives in i_nlink (offset 44);
+	// the field at offset 6 (NB) is the high bits of the block address
+	// (startblk_hi/blocks_hi), which is 0 for our <32-bit addresses. Writing
+	// nlink there corrupts the block address under the 48-bit reading that
+	// fsck.erofs/the kernel apply to extended inodes.
 	if ino.mode.IsDir() {
 		// nlink for dirs = 2 + number of child subdirectories.
 		nlink := uint32(2)
@@ -725,11 +788,10 @@ func (b *Builder) writeInode(ino *buildInode) error {
 			}
 		}
 		ei.NLink = nlink
-		ei.NB = uint16(nlink)
 	} else {
 		ei.NLink = 1
-		ei.NB = 1
 	}
+	ei.NB = 0
 
 	// Ino field: use a sequential number based on nid.
 	ei.Ino = uint32(ino.nid)
@@ -776,7 +838,7 @@ func (b *Builder) writeDataBlocks() error {
 
 		// Write compressed pclusters.
 		if cdata, ok := b.compressedData[ino]; ok {
-			if err := b.writeCompressedBlocks(cdata); err != nil {
+			if err := b.writeCompressedBlocks(ino, cdata); err != nil {
 				return fmt.Errorf("erofs: writing compressed blocks for %s: %w", ino.path, err)
 			}
 			continue
@@ -821,21 +883,20 @@ func (b *Builder) writeSuperblock() error {
 	// Count total inodes.
 	totalInodes := uint64(len(b.inodes))
 
-	// Compute total blocks.
+	// Compute total blocks. maxOff covers the metadata region; endDataBlk
+	// (captured in layoutDataBlocks) covers every out-of-line data extent
+	// regardless of layout.
 	var maxOff int64
 	for _, ino := range b.inodes {
-		if ino.dataLayout == ondisk.InodeFlatPlain && len(ino.data) > 0 {
-			end := int64(ino.startBlk)*int64(b.blockSize) + int64(len(ino.data))
-			if end > maxOff {
-				maxOff = end
-			}
-		}
 		end := ino.metaOff + int64(ino.metaSize)
 		if end > maxOff {
 			maxOff = end
 		}
 	}
 	totalBlocks := uint32((maxOff + int64(b.blockSize) - 1) / int64(b.blockSize))
+	if uint32(b.endDataBlk) > totalBlocks {
+		totalBlocks = uint32(b.endDataBlk)
+	}
 
 	// Write device table if we have extra devices.
 	var devtSlotOff uint16
@@ -905,6 +966,14 @@ func (b *Builder) writeSuperblock() error {
 		DevtSlotOff:     devtSlotOff,
 	}
 
+	// When a compression-config area is present, readers locate it at
+	// SuperOffset + 128 + sb_extslots*16. The builder writes it at
+	// SuperOffset + SuperBlockSize (1024+144), so advertise one extra slot
+	// (128 + 1*16 = 144) to make the offsets agree.
+	if b.comprCfgsSize() > 0 {
+		sb.SBExtSlots = (ondisk.SuperBlockSize - 128) / ondisk.SBExtSlotSize
+	}
+
 	// Also set RootNID8B for larger NID values.
 	sb.RootNID8B = rootNID
 
@@ -956,6 +1025,15 @@ func (b *Builder) computeIncompatFeatures() uint32 {
 		if b.compression == CompressionZstd {
 			flags |= ondisk.FeatureIncompatComprCfgs
 		}
+		for _, cdata := range b.compressedData {
+			for _, e := range cdata.indexEntries {
+				if e.Type() == ondisk.LClusterTypeNonHead {
+					// Same bit value as COMPR_CFGS (0x2); harmless to OR again.
+					flags |= ondisk.FeatureIncompatBigPCluster
+					break
+				}
+			}
+		}
 	}
 	if b.chunkBits > 0 {
 		flags |= ondisk.FeatureIncompatChunkedFile
@@ -975,39 +1053,61 @@ func (b *Builder) comprAlgID() uint8 {
 }
 
 // comprCfgsSize returns the number of bytes occupied by the compression-config
-// area that immediately follows the superblock. Only zstd needs it; the record
-// is a __le16 size (2 bytes) followed by a z_erofs_zstd_cfgs struct.
+// area that immediately follows the superblock. When EROFS_FEATURE_INCOMPAT_-
+// COMPR_CFGS is set (which the big-pcluster bit implies, since they share a
+// bit), readers expect one record per available algorithm: a __le16 size
+// followed by that algorithm's config struct.
 func (b *Builder) comprCfgsSize() int64 {
-	if len(b.compressedData) == 0 || b.compression != CompressionZstd {
+	if len(b.compressedData) == 0 {
 		return 0
 	}
-	return 2 + int64(binary.Size(ondisk.ZstdCfgs{})) // __le16 size + struct
+	switch b.compression {
+	case CompressionZstd:
+		return 2 + int64(binary.Size(ondisk.ZstdCfgs{}))
+	case CompressionAutoLZ4:
+		return 2 + int64(binary.Size(ondisk.LZ4Cfgs{}))
+	default:
+		return 0
+	}
 }
 
-// writeComprCfgs writes the compression-config area for zstd images. The kernel
-// reads it from EROFS_SUPER_OFFSET + sizeof(superblock); this builder's
-// superblock is SuperBlockSize bytes, so the area starts at byte 1024+144.
-// Must be called before writeSuperblock, because the superblock checksum covers
-// this region.
+// writeComprCfgs writes the compression-config area. Readers (kernel and
+// erofs-utils) locate it at EROFS_SUPER_OFFSET + 128 + sb_extslots*16; the
+// builder sets sb_extslots so that resolves to EROFS_SUPER_OFFSET +
+// SuperBlockSize (= 1024+144), where this writes. Must be called before
+// writeSuperblock, because the superblock checksum covers this region.
 func (b *Builder) writeComprCfgs() error {
 	if b.comprCfgsSize() == 0 {
 		return nil
 	}
-	// The zstd window log equals the block-size bits for this builder
-	// (h_clusterbits = 0, so each extent decompresses to one block). The
-	// encoder floors the window at 1024 bytes, so clamp to zstd's minimum
-	// window log (ZSTD_WINDOWLOG_ABSOLUTEMIN = 10) to match and avoid underflow.
-	wbits := b.blkSzBits
-	if wbits < 10 {
-		wbits = 10
+
+	var rec any
+	switch b.compression {
+	case CompressionZstd:
+		// A big pcluster decompresses to pclusterSize bytes, so the zstd window
+		// tracks the pcluster size. On disk the window log is stored minus
+		// ZSTD_WINDOWLOG_ABSOLUTEMIN (10).
+		wbits := int(b.pclusterBitsEff())
+		if wbits < 10 {
+			wbits = 10
+		}
+		rec = &ondisk.ZstdCfgs{WindowLog: uint8(wbits - 10)}
+	case CompressionAutoLZ4:
+		// max_distance is the LZ4 window (kernel default 65535);
+		// max_pclusterblks bounds the big-pcluster physical size in blocks.
+		rec = &ondisk.LZ4Cfgs{
+			MaxDistance:   0xFFFF,
+			MaxPClusterBs: uint16(b.pclusterLclustersEff()),
+		}
+	default:
+		return nil
 	}
-	cfg := ondisk.ZstdCfgs{WindowLog: wbits - 10}
 
 	var buf bytes.Buffer
-	if err := binary.Write(&buf, binary.LittleEndian, uint16(binary.Size(cfg))); err != nil {
+	if err := binary.Write(&buf, binary.LittleEndian, uint16(binary.Size(rec))); err != nil {
 		return err
 	}
-	if err := binary.Write(&buf, binary.LittleEndian, &cfg); err != nil {
+	if err := binary.Write(&buf, binary.LittleEndian, rec); err != nil {
 		return err
 	}
 	off := int64(ondisk.SuperOffset) + int64(ondisk.SuperBlockSize)

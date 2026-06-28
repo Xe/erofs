@@ -105,7 +105,7 @@ func (b *Builder) writeChunkedInode(ino *buildInode) error {
 		GID:    ino.gid,
 		Mtime:  ino.mtime.Unix() - b.epoch,
 		NLink:  1,
-		NB:     1,
+		NB:     0, // extended inode: offset-6 is startblk_hi/blocks_hi, not nlink
 		Ino:    uint32(ino.nid),
 	}
 

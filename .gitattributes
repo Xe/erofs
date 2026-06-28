@@ -1,0 +1,6 @@
+# Byte-exact test fixtures must never be line-ending converted. Without this,
+# git's autocrlf on Windows rewrites \n to \r\n in the text fixtures, so tests
+# that compare decompressed output against them read the wrong byte count.
+testdata/*.img binary
+testdata/*.bin binary
+testdata/bigpcluster-lz4-c1.txt binary

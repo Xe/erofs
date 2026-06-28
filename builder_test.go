@@ -652,6 +652,50 @@ func TestBuilderZstdComprCfgs(t *testing.T) {
 	}
 }
 
+// TestBuilderZstdComprCfgsBlockSize guards the windowlog derivation
+// (blkSzBits - ZSTD_WINDOWLOG_ABSOLUTEMIN) at a non-default block size, since
+// it is the one piece of the cfgs record that cannot be validated against the
+// kernel locally.
+func TestBuilderZstdComprCfgsBlockSize(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	const blkSzBits = 14 // 16 KiB blocks
+
+	buf := newWriterAtBuffer(1 << 20)
+	b := NewBuilder(buf, WithBlockSize(blkSzBits), WithEpoch(epoch), WithCompression(CompressionZstd))
+	b.AddDir("/", &staticFileInfo{name: "/", mode: fs.ModeDir | 0o755, mod: epoch})
+
+	// Must exceed one block (16 KiB) so it is eligible for compression.
+	data := bytes.Repeat([]byte("zstd windowlog at a larger block size\n"), 2000)
+	b.AddFile("/big.txt", &staticFileInfo{
+		name: "big.txt", mode: 0o644, size: int64(len(data)), mod: epoch,
+	}, data)
+	if err := b.Build(); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	img := buf.Bytes()
+
+	off := 1024 + 144
+	if size := binary.LittleEndian.Uint16(img[off:]); size != 32 {
+		t.Fatalf("zstd cfgs size = %d, want 32", size)
+	}
+	// windowlog on disk = blkSzBits - ZSTD_WINDOWLOG_ABSOLUTEMIN(10) = 4.
+	if windowLog := img[off+3]; windowLog != blkSzBits-10 {
+		t.Fatalf("zstd cfgs windowlog = %d, want %d", windowLog, blkSzBits-10)
+	}
+
+	fsys, err := Open(bytes.NewReader(img))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	got, err := fs.ReadFile(fsys, "big.txt")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("content mismatch at block size %d", blkSzBits)
+	}
+}
+
 // staticFileInfo implements fs.FileInfo for testing.
 type staticFileInfo struct {
 	name string

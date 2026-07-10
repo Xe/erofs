@@ -2,9 +2,13 @@ package erofs
 
 import (
 	"bytes"
+	"encoding/binary"
+	"io"
 	"testing"
 	"testing/fstest"
 	"time"
+
+	"github.com/Xe/erofs/internal/ondisk"
 )
 
 // buildWithEpoch builds an image from fsys pinned to epoch and returns the bytes.
@@ -39,5 +43,34 @@ func TestReproducibleIgnoresFileMtime(t *testing.T) {
 
 	if !bytes.Equal(a, b) {
 		t.Error("image bytes depend on staged file mtime; build is not reproducible")
+	}
+}
+
+// TestReproducibleBuildTime proves the superblock build time is pinned to the
+// epoch (on-disk BuildTime == 0) rather than stamped from the wall clock.
+func TestReproducibleBuildTime(t *testing.T) {
+	epoch := time.Unix(1_700_000_000, 0)
+	buf := newWriterAtBuffer(64 * 1024)
+	b := NewBuilder(buf, WithBlockSize(12), WithEpoch(epoch))
+	if err := b.AddFromFS(fstest.MapFS{
+		"README.md": &fstest.MapFile{Data: []byte("# hello\n"), Mode: 0o644, ModTime: epoch},
+	}); err != nil {
+		t.Fatalf("AddFromFS: %v", err)
+	}
+	if err := b.Build(); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	var sb ondisk.SuperBlock
+	sr := io.NewSectionReader(bytes.NewReader(buf.Bytes()), ondisk.SuperOffset, ondisk.SuperBlockSize)
+	if err := binary.Read(sr, binary.LittleEndian, &sb); err != nil {
+		t.Fatalf("decode superblock: %v", err)
+	}
+
+	if sb.BuildTime != 0 {
+		t.Errorf("superblock BuildTime = %d, want 0 (pinned to epoch)", sb.BuildTime)
+	}
+	if sb.Epoch != epoch.Unix() {
+		t.Errorf("superblock Epoch = %d, want %d", sb.Epoch, epoch.Unix())
 	}
 }

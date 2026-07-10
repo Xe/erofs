@@ -114,9 +114,8 @@ func (b *Builder) pclusterSizeEff() int { return 1 << b.pclusterBitsEff() }
 func (b *Builder) pclusterLclustersEff() int { return b.pclusterSizeEff() / b.blockSize }
 
 // WithEpoch sets the filesystem epoch timestamp. When set, all inode
-// modification times are pinned to this timestamp, so staged file mtimes
-// no longer leak into the image. (The superblock build time is pinned
-// separately.)
+// modification times and the superblock build time are pinned to this
+// timestamp, making the image byte-for-byte reproducible.
 func WithEpoch(t time.Time) BuildOption {
 	return func(b *Builder) {
 		b.epoch = t.Unix()
@@ -967,6 +966,11 @@ func (b *Builder) writeSuperblock() error {
 		totalBlocks = uint32((maxOff + int64(b.blockSize) - 1) / int64(b.blockSize))
 	}
 
+	buildTime := uint32(0)
+	if !b.epochSet {
+		buildTime = uint32(time.Now().Unix() - b.epoch)
+	}
+
 	sb := ondisk.SuperBlock{
 		Magic:           ondisk.SuperMagic,
 		FeatureCompat:   ondisk.FeatureCompatSBChksum | ondisk.FeatureCompatMtime,
@@ -977,7 +981,7 @@ func (b *Builder) writeSuperblock() error {
 		BlocksLo:        totalBlocks,
 		MetaBlkAddr:     b.metaBlkAddr,
 		FeatureIncompat: b.computeIncompatFeatures(),
-		BuildTime:       uint32(time.Now().Unix() - b.epoch),
+		BuildTime:       buildTime,
 		AvailComprAlgs:  b.computeComprAlgs(),
 		ExtraDevices:    extraDevices,
 		DevtSlotOff:     devtSlotOff,

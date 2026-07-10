@@ -96,6 +96,7 @@ func (b *Builder) writeChunkedInode(ino *buildInode) error {
 		chunkFormat |= uint16(b.chunkBits-b.blkSzBits) & ondisk.ChunkFormatBlkBitsMask
 	}
 
+	mtSec, _ := b.diskMtime(ino.mtime)
 	ei := ondisk.InodeExtended{
 		Format: uint16(ondisk.InodeLayoutExtended) | uint16(ino.dataLayout)<<ondisk.IDataLayoutBit,
 		Mode:   erofsModeFromFS(ino.mode),
@@ -103,7 +104,7 @@ func (b *Builder) writeChunkedInode(ino *buildInode) error {
 		U:      uint32(chunkFormat),
 		UID:    ino.uid,
 		GID:    ino.gid,
-		Mtime:  ino.mtime.Unix() - b.epoch,
+		Mtime:  mtSec,
 		NLink:  1,
 		NB:     0, // extended inode: offset-6 is startblk_hi/blocks_hi, not nlink
 		Ino:    uint32(ino.nid),

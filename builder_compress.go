@@ -255,6 +255,7 @@ func computeCompressedMetaSize(numLclusters int) int {
 
 // writeCompressedInode writes a compressed inode's metadata.
 func (b *Builder) writeCompressedInode(ino *buildInode, cdata *compressedFileData) error {
+	mtSec, mtNsec := b.diskMtime(ino.mtime)
 	ei := ondisk.InodeExtended{
 		Format:    uint16(ondisk.InodeLayoutExtended) | uint16(ondisk.InodeCompressedFull)<<ondisk.IDataLayoutBit,
 		Mode:      erofsModeFromFS(ino.mode),
@@ -262,8 +263,8 @@ func (b *Builder) writeCompressedInode(ino *buildInode, cdata *compressedFileDat
 		U:         uint32(len(cdata.blocks)), // blocks_lo = total physical blocks
 		UID:       ino.uid,
 		GID:       ino.gid,
-		Mtime:     ino.mtime.Unix() - b.epoch,
-		MtimeNsec: uint32(ino.mtime.Nanosecond()),
+		Mtime:     mtSec,
+		MtimeNsec: mtNsec,
 		NLink:     1,
 		NB:        0, // extended inode: offset-6 is startblk_hi/blocks_hi, not nlink
 	}

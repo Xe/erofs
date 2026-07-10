@@ -28,6 +28,7 @@ type Builder struct {
 	nextNID          uint64
 	metaBlkAddr      uint32
 	epoch            int64
+	epochSet         bool
 	compression      CompressionAlgorithm
 	compressEnabled  bool
 	compressedData   map[*buildInode]*compressedFileData
@@ -112,10 +113,13 @@ func (b *Builder) pclusterSizeEff() int { return 1 << b.pclusterBitsEff() }
 
 func (b *Builder) pclusterLclustersEff() int { return b.pclusterSizeEff() / b.blockSize }
 
-// WithEpoch sets the filesystem epoch timestamp.
+// WithEpoch sets the filesystem epoch timestamp. When set, all inode
+// modification times and the superblock build time are pinned to this
+// timestamp, making the image byte-for-byte reproducible.
 func WithEpoch(t time.Time) BuildOption {
 	return func(b *Builder) {
 		b.epoch = t.Unix()
+		b.epochSet = true
 	}
 }
 
@@ -755,12 +759,24 @@ func (b *Builder) writeMetadata() error {
 	return nil
 }
 
+// diskMtime returns the on-disk (mtime, mtime_nsec) fields for a modification time.
+// When an epoch is configured the timestamp is pinned to the epoch (on-disk
+// delta 0, nsec 0) so builds are reproducible; otherwise the file's own
+// modification time is used, stored relative to the epoch.
+func (b *Builder) diskMtime(mt time.Time) (sec int64, nsec uint32) {
+	if b.epochSet {
+		return 0, 0
+	}
+	return mt.Unix() - b.epoch, uint32(mt.Nanosecond())
+}
+
 func (b *Builder) writeInode(ino *buildInode) error {
 	if ino.dataLayout == ondisk.InodeChunkBased {
 		return b.writeChunkedInode(ino)
 	}
 
 	// Build the extended inode.
+	mtSec, mtNsec := b.diskMtime(ino.mtime)
 	ei := ondisk.InodeExtended{
 		Format:    uint16(ondisk.InodeLayoutExtended) | uint16(ino.dataLayout)<<ondisk.IDataLayoutBit,
 		Mode:      erofsModeFromFS(ino.mode),
@@ -768,8 +784,8 @@ func (b *Builder) writeInode(ino *buildInode) error {
 		U:         uint32(ino.startBlk),
 		UID:       ino.uid,
 		GID:       ino.gid,
-		Mtime:     ino.mtime.Unix() - b.epoch,
-		MtimeNsec: uint32(ino.mtime.Nanosecond()),
+		Mtime:     mtSec,
+		MtimeNsec: mtNsec,
 	}
 
 	// Set nlink. In the extended inode, nlink lives in i_nlink (offset 44);
@@ -950,6 +966,11 @@ func (b *Builder) writeSuperblock() error {
 		totalBlocks = uint32((maxOff + int64(b.blockSize) - 1) / int64(b.blockSize))
 	}
 
+	buildTime := uint32(0)
+	if !b.epochSet {
+		buildTime = uint32(time.Now().Unix() - b.epoch)
+	}
+
 	sb := ondisk.SuperBlock{
 		Magic:           ondisk.SuperMagic,
 		FeatureCompat:   ondisk.FeatureCompatSBChksum | ondisk.FeatureCompatMtime,
@@ -960,7 +981,7 @@ func (b *Builder) writeSuperblock() error {
 		BlocksLo:        totalBlocks,
 		MetaBlkAddr:     b.metaBlkAddr,
 		FeatureIncompat: b.computeIncompatFeatures(),
-		BuildTime:       uint32(time.Now().Unix() - b.epoch),
+		BuildTime:       buildTime,
 		AvailComprAlgs:  b.computeComprAlgs(),
 		ExtraDevices:    extraDevices,
 		DevtSlotOff:     devtSlotOff,

@@ -1,3 +1,10 @@
+## [0.6.1](https://github.com/Xe/erofs/compare/v0.6.0...v0.6.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* **builder:** pin timestamps to epoch for reproducible images ([#7](https://github.com/Xe/erofs/issues/7)) ([564a966](https://github.com/Xe/erofs/commit/564a966219fb0eb22d72e4478ef024348ffcf991))
+
 # [0.6.0](https://github.com/Xe/erofs/compare/v0.5.0...v0.6.0) (2026-06-28)
 
 

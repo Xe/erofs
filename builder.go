@@ -41,6 +41,10 @@ type Builder struct {
 	blobInfos        map[uint16]BlobInfo // device ID -> blob metadata
 	flatDev          bool                // flat device mode: compute UniAddr for each device
 	endDataBlk       int64               // first block past all out-of-line data (for BlocksLo)
+	spoolDir         string              // directory for the compression spool; "" = os.TempDir()
+	spool            *spool              // compressed blocks between steps 3b and 7; nil until needed
+	groupBuf         []byte              // reused buffer for one pcluster group
+	compBuf          []byte              // reused output buffer of compressGroup
 }
 
 type buildInode struct {
@@ -52,6 +56,8 @@ type buildInode struct {
 	mtime      time.Time
 	data       []byte                        // file content or symlink target
 	open       func() (io.ReadCloser, error) // deferred regular-file source
+	spooled    bool                          // flat content is in the spool at spoolOff
+	spoolOff   int64
 	dataLayout uint8
 	startBlk   uint64
 	metaOff    int64 // absolute byte offset where metadata is written
@@ -122,6 +128,15 @@ func WithEpoch(t time.Time) BuildOption {
 	return func(b *Builder) {
 		b.epoch = t.Unix()
 		b.epochSet = true
+	}
+}
+
+// WithSpoolDir sets the directory for the temp file that holds compressed
+// blocks during Build. The default is os.TempDir(). Build removes the file
+// before it returns.
+func WithSpoolDir(dir string) BuildOption {
+	return func(b *Builder) {
+		b.spoolDir = dir
 	}
 }
 
@@ -229,8 +244,11 @@ func (b *Builder) AddSymlink(p string, target string, info fs.FileInfo) error {
 	return nil
 }
 
-// AddFromFS walks an fs.FS and adds all entries to the image. Regular files
-// are opened during Build; if their size changes after the walk, Build fails.
+// AddFromFS walks an fs.FS and adds all entries to the image. It adds regular
+// files with AddFileFunc, so Build opens them and does not keep their content
+// in memory. If the size of a file changes after the walk, Build fails. With
+// compression on, Build writes compressed blocks to a temp file (see
+// WithSpoolDir).
 func (b *Builder) AddFromFS(fsys fs.FS) error {
 	return fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -277,7 +295,13 @@ func (b *Builder) AddFromFS(fsys fs.FS) error {
 }
 
 // Build finalizes the image and writes it to the underlying writer.
-func (b *Builder) Build() error {
+func (b *Builder) Build() (err error) {
+	defer func() {
+		if spoolErr := b.closeSpool(); spoolErr != nil && err == nil {
+			err = spoolErr
+		}
+	}()
+
 	// Step 1: Ensure the root directory and all parent directories exist.
 	if _, ok := b.dirs["/"]; !ok {
 		b.dirs["/"] = &buildDir{children: make(map[string]*buildInode)}
@@ -289,19 +313,14 @@ func (b *Builder) Build() error {
 	if err := b.buildDirEntries(); err != nil {
 		return err
 	}
-	if b.compressEnabled && b.compression != CompressionNone {
-		if err := b.loadLazyData(); err != nil {
-			return err
-		}
-	}
 
 	// Step 3: Decide data layout and compute metadata sizes.
 	b.computeLayouts()
 
 	// Step 3b: Try compressing eligible files.
 	b.compressedData = make(map[*buildInode]*compressedFileData)
-	if b.compressEnabled {
-		b.tryCompressInodes()
+	if err := b.tryCompressInodes(); err != nil {
+		return err
 	}
 
 	// Step 4: Assign NIDs.
@@ -537,21 +556,57 @@ func (b *Builder) packDirBlock(dirents []buildDirent) []byte {
 	return result
 }
 
-// tryCompressInodes attempts compression on eligible file inodes.
-func (b *Builder) tryCompressInodes() {
+// tryCompressInodes attempts compression on eligible file inodes. It reads
+// each candidate once, from its source, and puts the resulting blocks in the
+// spool.
+func (b *Builder) tryCompressInodes() error {
 	for _, ino := range b.inodes {
-		if ino.mode.IsDir() || ino.mode&fs.ModeSymlink != 0 || ino.mode&fs.ModeType != 0 {
+		if !b.isCompressionCandidate(ino) {
 			continue
 		}
-		cdata, ok := b.tryCompressFile(ino)
-		if !ok {
-			continue
+		sp, err := b.openSpool()
+		if err != nil {
+			return err
 		}
-		// Switch to compressed layout.
-		ino.dataLayout = ondisk.InodeCompressedFull
-		ino.metaSize = computeCompressedMetaSize(len(cdata.indexEntries))
-		b.compressedData[ino] = cdata
+		start := sp.end
+		var (
+			cdata *compressedFileData
+			ok    bool
+		)
+		compress := func(r io.Reader) (err error) {
+			cdata, ok, err = b.tryCompressFile(ino, r, sp)
+			return err
+		}
+		if ino.open != nil {
+			err = b.withLazyReader(ino, compress)
+		} else {
+			err = compress(bytes.NewReader(ino.data))
+		}
+		if err != nil {
+			return err
+		}
+
+		switch {
+		case ok:
+			// Switch to compressed layout. The blocks are in the spool.
+			ino.dataLayout = ondisk.InodeCompressedFull
+			ino.metaSize = computeCompressedMetaSize(len(cdata.indexEntries))
+			cdata.spoolOff = start
+			b.compressedData[ino] = cdata
+			ino.open = nil
+		case ino.open != nil:
+			// The file stays flat. The spool holds its raw data, so step 7
+			// copies it from there and does not open the source again.
+			ino.open = nil
+			ino.spooled = true
+			ino.spoolOff = start
+		default:
+			// The file stays flat and its data is in memory. Drop the
+			// spool copy.
+			sp.end = start
+		}
 	}
+	return nil
 }
 
 // computeLayouts decides FLAT_INLINE vs FLAT_PLAIN for each inode.
@@ -837,7 +892,7 @@ func (b *Builder) writeInode(ino *buildInode) error {
 	}
 
 	// Write inline tail data if FLAT_INLINE.
-	if ino.open == nil && ino.dataLayout == ondisk.InodeFlatInline && ino.size > 0 {
+	if !ino.deferred() && ino.dataLayout == ondisk.InodeFlatInline && ino.size > 0 {
 		var tailData []byte
 		if int64(len(ino.data)) <= int64(b.blockSize) {
 			// Entire data is inline.
@@ -859,7 +914,7 @@ func (b *Builder) writeInode(ino *buildInode) error {
 // writeDataBlocks writes out-of-line data blocks.
 func (b *Builder) writeDataBlocks() error {
 	for _, ino := range b.inodes {
-		if ino.open != nil || ino.size == 0 {
+		if ino.size == 0 {
 			continue
 		}
 
@@ -869,6 +924,10 @@ func (b *Builder) writeDataBlocks() error {
 				return fmt.Errorf("erofs: writing compressed blocks for %s: %w", ino.path, err)
 			}
 			continue
+		}
+
+		if ino.deferred() {
+			continue // writeLazyData writes it.
 		}
 
 		switch ino.dataLayout {
@@ -897,6 +956,12 @@ func (b *Builder) writeDataBlocks() error {
 		}
 	}
 	return nil
+}
+
+// deferred reports whether the flat content of ino is not in memory, so that
+// writeLazyData writes it from its source or from the spool.
+func (ino *buildInode) deferred() bool {
+	return ino.open != nil || ino.spooled
 }
 
 // withLazyReader keeps at most one source open and reports close failures.
@@ -935,47 +1000,15 @@ func checkLazyEnd(ino *buildInode, r io.Reader, read int64) error {
 	return nil
 }
 
-// loadLazyData preserves the existing compression path, which needs full files
-// before it can choose layouts. Flat builds never call this method.
-func (b *Builder) loadLazyData() error {
-	for _, ino := range b.inodes {
-		if ino.open == nil {
-			continue
-		}
-		if ino.size == 0 {
-			ino.open = nil
-			continue
-		}
-		err := b.withLazyReader(ino, func(r io.Reader) error {
-			data, err := io.ReadAll(io.LimitReader(r, ino.size))
-			if err != nil {
-				return fmt.Errorf("erofs: reading %s: %w", ino.path, err)
-			}
-			if int64(len(data)) != ino.size {
-				return lazySizeError(ino, int64(len(data)))
-			}
-			if err := checkLazyEnd(ino, r, ino.size); err != nil {
-				return err
-			}
-			ino.data = data
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		ino.open = nil
-	}
-	return nil
-}
-
-// writeLazyData copies flat files directly from their sources to final offsets.
+// writeLazyData copies deferred flat files to their final offsets, from their
+// sources, or from the spool for a candidate that stayed flat.
 func (b *Builder) writeLazyData() error {
 	buf := make([]byte, b.blockSize)
 	for _, ino := range b.inodes {
-		if ino.open == nil || ino.size == 0 {
+		if !ino.deferred() || ino.size == 0 {
 			continue
 		}
-		err := b.withLazyReader(ino, func(r io.Reader) error {
+		copyFlat := func(r io.Reader) error {
 			var read int64
 			full := ino.size / int64(b.blockSize)
 			off := int64(ino.startBlk) * int64(b.blockSize)
@@ -1025,7 +1058,15 @@ func (b *Builder) writeLazyData() error {
 				}
 			}
 			return checkLazyEnd(ino, r, read)
-		})
+		}
+		var err error
+		if ino.spooled {
+			// The spool holds the file data contiguously, padded after the
+			// last byte, so the first ino.size bytes are the file.
+			err = copyFlat(io.NewSectionReader(b.spool.f, ino.spoolOff, ino.size))
+		} else {
+			err = b.withLazyReader(ino, copyFlat)
+		}
 		if err != nil {
 			return err
 		}

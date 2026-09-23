@@ -1,3 +1,18 @@
+## Unreleased (v0.8.0)
+
+### Features
+
+* Stream compressed builds. `Build` reads each file from its source one time, compresses it one pcluster at a time, and keeps the compressed blocks in a temp file. The memory for a compressed build no longer depends on the size of the files. The image bytes do not change.
+* Add `WithSpoolDir` to set the directory of the temp file for compressed builds. The default is `os.TempDir()`.
+* `AddFromFS` and `AddFileFunc` now use bounded memory with compression on. `Build` calls `open` one time for each nonempty file, also with compression on.
+
+### Bug Fixes
+
+* `Build` no longer fails with `reading first block for checksum: EOF` when the image is smaller than one block. `Build` now pads the image to the block count in the superblock, as `mkfs.erofs` does.
+* A writer that is not an `io.ReaderAt` now gets a correct superblock checksum. Before, `Open` and `Validate` rejected these images.
+* `Build` now creates the root directory and parent directories that were not added with `AddDir`. Before, the root had no inode, and implicit subdirectories and their files were missing from the image.
+* `AddDir` no longer drops the entries that were added to that directory before the `AddDir` call.
+
 # [0.7.0](https://github.com/Xe/erofs/compare/v0.6.1...v0.7.0) (2026-09-23)
 
 

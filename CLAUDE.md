@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Go implementation of EROFS (Enhanced Read-Only File System). Provides an `fs.FS` driver for reading EROFS images and a `Builder` for creating them. The reader supports LZ4, LZMA, DEFLATE, and Zstandard decompression; the builder emits LZ4 or Zstandard. The builder packs compressed data into big pclusters (one pcluster spans several lclusters and occupies `ceil(compressed_len / block_size)` physical blocks), so compressed images are actually smaller; the compression level is tunable via `WithCompressionLevel` (zstd levels, or lz4hc for LZ4). Output is intended to be bytewise compatible with the Linux kernel EROFS driver and mkfs.erofs: LZ4 output is validated locally against `fsck.erofs --extract`, but the zstd path (compr_cfgs + zstd big pclusters) is not — the locally installed erofs-utils is built without zstd support, so validate it out of band against erofs-utils >= 1.8.
+Go implementation of EROFS (Enhanced Read-Only File System). Provides an `fs.FS` driver for reading EROFS images and a `Builder` for creating them. The reader supports LZ4, LZMA, DEFLATE, and Zstandard decompression; the builder emits LZ4 or Zstandard. The builder packs compressed data into big pclusters (one pcluster spans several lclusters and occupies `ceil(compressed_len / block_size)` physical blocks), so compressed images are actually smaller; the compression level is tunable via `WithCompressionLevel` (zstd levels, or lz4hc for LZ4). Output is intended to be bytewise compatible with the Linux kernel EROFS driver and mkfs.erofs: validate output against `fsck.erofs --extract` from erofs-utils >= 1.8, which has zstd support. erofs-utils is not installed locally; use Docker: `docker run --rm -v "$PWD/imgs:/img" debian:trixie bash -c 'apt-get update -qq && apt-get install -y -qq erofs-utils && fsck.erofs --extract=/tmp/x /img/test.img'`.
 
 ## Commands
 
@@ -28,6 +28,7 @@ The root package (`github.com/Xe/erofs`) contains both the reader and builder:
 - **Reader**: `FS` struct implements `fs.FS`, `fs.StatFS`, `fs.ReadLinkFS`. Constructed via `Open()` from any `io.ReaderAt`. All on-disk access is stream-based through `io.ReaderAt` -- no mmap.
 - **Builder**: `Builder` struct creates EROFS images via a fluent API with `BuildOption` functional options. Two-phase: accumulate files, then serialize to `io.WriterAt`.
 - **Compression**: Pluggable decompressor system in `compress.go` / `builder_compress.go`. Algorithm IDs 0-3 map to LZ4, LZMA, DEFLATE, Zstandard.
+- **Streaming builds**: `AddFileFunc` sources are opened during `Build`. Compression candidates are read once at step 3b. Their blocks go to a temp-file spool (`builder_spool.go`) and are copied to the image at step 7. Build memory must not depend on file content (`TestAddFileFuncMemory`).
 - **Path resolution**: Recursive symlink following with a depth limit of 40. Handles both relative and absolute symlinks.
 
 `internal/ondisk` defines all binary on-disk structures (`SuperBlock`, `InodeCompact`, `InodeExtended`, `Dirent`, etc.) and format constants. These map directly to the Linux kernel's `erofs_fs.h`.

@@ -134,10 +134,23 @@ if err := b.Build(); err != nil {
 }
 ```
 
-`AddFileFunc` opens each nonempty file during `Build` and closes it before
-opening the next one. Without compression, file content is copied with a
-single block-sized buffer. `AddFromFS` uses the same path; files must keep
-their measured size until `Build` completes.
+`AddFileFunc` opens each nonempty file one time, during `Build`. It closes
+the file before it opens the next one. The memory that `Build` uses does not
+depend on the size of the files, with or without compression. `AddFromFS`
+uses the same path. Each file must keep its measured size until `Build`
+returns.
+
+With compression on, `Build` keeps the compressed blocks in a temp file until
+it writes them to the image. The temp file is in `os.TempDir()` by default.
+Use `WithSpoolDir` to put it in a different directory. `Build` removes the
+temp file before it returns.
+
+```go
+b := erofs.NewBuilder(out,
+    erofs.WithCompression(erofs.CompressionZstd),
+    erofs.WithSpoolDir("/var/tmp"),
+)
+```
 
 ## CLI tools
 

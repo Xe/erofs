@@ -2,6 +2,8 @@ package erofs
 
 import (
 	"encoding/binary"
+	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 
@@ -60,41 +62,47 @@ func isIncompressible(path string, size int64) bool {
 	return incompressibleExts[ext]
 }
 
-// tryCompressFile attempts to compress file data using the selected compression algorithm.
-// Returns the compressed lcluster data and the FULL index entries,
-// or nil if the file should remain uncompressed.
-func (b *Builder) tryCompressFile(ino *buildInode) (*compressedFileData, bool) {
-	if !b.compressEnabled || b.compression == CompressionNone {
-		return nil, false
+// isCompressionCandidate reports whether tryCompressInodes must read a file to
+// decide its layout. It uses only the metadata of the file. All other regular
+// files stay flat, and the builder reads them only at step 7.
+func (b *Builder) isCompressionCandidate(ino *buildInode) bool {
+	if !b.compressEnabled {
+		return false
 	}
-	if isIncompressible(ino.path, ino.size) {
-		return nil, false
-	}
-	// Don't compress very small files -- inline is better.
-	if ino.size <= int64(b.blockSize) {
-		return nil, false
-	}
-
 	// Only LZ4 and Zstandard are supported; anything else stores the file
 	// uncompressed rather than failing the build.
 	switch b.compression {
 	case CompressionAutoLZ4, CompressionZstd:
-		// supported
 	default:
-		return nil, false
+		return false
 	}
+	if ino.mode.Type() != 0 || ino.dataLayout == ondisk.InodeChunkBased {
+		return false
+	}
+	// Don't compress very small files -- inline is better.
+	if ino.size <= int64(b.blockSize) {
+		return false
+	}
+	return !isIncompressible(ino.path, ino.size)
+}
 
-	data := ino.data
+// tryCompressFile compresses a candidate file, one pcluster group at a time,
+// from r. It appends each physical block to sp. It returns the index entries,
+// or ok == false if the file should remain uncompressed. In that case no group
+// was compressed, so sp holds the raw file data, padded to whole blocks.
+func (b *Builder) tryCompressFile(ino *buildInode, r io.Reader, sp *spool) (cdata *compressedFileData, ok bool, err error) {
 	bs := b.blockSize
-	size := len(data)
+	size := ino.size
 	K := b.pclusterLclustersEff() // logical lclusters per pcluster (>= 2)
-	tail := size % bs             // partial-tail bytes (0 if block-aligned)
-	totalLclusters := (size + bs - 1) / bs
+	tail := int(size % int64(bs)) // partial-tail bytes (0 if block-aligned)
+	totalLclusters := int((size + int64(bs) - 1) / int64(bs))
+	buf := b.groupBuffer()
 
 	var (
-		blocks  [][]byte
-		entries []ondisk.LClusterIndex
-		blockOf []int
+		read    int64
+		nblocks int
+		entries = make([]ondisk.LClusterIndex, 0, totalLclusters)
+		blockOf = make([]int, 0, totalLclusters)
 		anyBig  bool
 	)
 
@@ -109,31 +117,41 @@ func (b *Builder) tryCompressFile(ino *buildInode) (*compressedFileData, bool) {
 			groupEnd = totalLclusters
 		}
 		spanLcl := groupEnd - lcn
-		g0 := lcn * bs
-		g1 := groupEnd * bs
-		if g1 > size {
-			g1 = size // final group includes the partial tail
-		}
-		group := data[g0:g1]
+		g0 := int64(lcn) * int64(bs)
+		g1 := min(int64(groupEnd)*int64(bs), size) // final group includes the partial tail
+		group := buf[:g1-g0]
 
-		comp, ok := b.compressGroup(group)
+		n, err := io.ReadFull(r, group)
+		read += int64(n)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return nil, false, lazySizeError(ino, read)
+		}
+		if err != nil {
+			return nil, false, fmt.Errorf("erofs: reading %s: %w", ino.path, err)
+		}
+
+		comp, compOK := b.compressGroup(group)
 		cBlocks := 0
-		if ok {
+		if compOK {
 			cBlocks = (len(comp) + bs - 1) / bs
 		}
 
-		if ok && cBlocks > 0 && cBlocks < spanLcl {
+		if compOK && cBlocks > 0 && cBlocks < spanLcl {
 			// Big pcluster: dense compressed blocks + HEAD/NONHEAD index.
 			// EROFS 0-padding: the compressed stream is right-aligned within
 			// its physical blocks (leading zero padding). Readers locate the
 			// stream by skipping leading zeros, so the remaining length is the
 			// exact compressed size -- which liblz4's partial decode requires.
-			headBlock := len(blocks)
-			packed := make([]byte, cBlocks*bs)
-			copy(packed[len(packed)-len(comp):], comp)
-			for i := range cBlocks {
-				blocks = append(blocks, packed[i*bs:(i+1)*bs])
+			// The group bytes are no longer needed, so pack into buf.
+			headBlock := nblocks
+			packed := buf[:cBlocks*bs]
+			pad := len(packed) - len(comp)
+			clear(packed[:pad])
+			copy(packed[pad:], comp)
+			if err := sp.append(packed); err != nil {
+				return nil, false, err
 			}
+			nblocks += cBlocks
 			lastLcn := groupEnd - 1
 			tailMarker := groupEnd == totalLclusters && tail != 0
 			for j := range spanLcl {
@@ -169,48 +187,53 @@ func (b *Builder) tryCompressFile(ino *buildInode) (*compressedFileData, bool) {
 			}
 			anyBig = true
 		} else {
-			// Incompressible group: store each lcluster as its own PLAIN block.
-			for j := range spanLcl {
-				cur := lcn + j
-				s := cur * bs
-				e := s + bs
-				if e > size {
-					e = size
-				}
-				blk := make([]byte, bs)
-				copy(blk, data[s:e])
-				lb := len(blocks)
-				blocks = append(blocks, blk)
+			// Incompressible group: store each lcluster as its own PLAIN
+			// block. The last one is padded with zeros.
+			raw := buf[:spanLcl*bs]
+			clear(raw[len(group):])
+			if err := sp.append(raw); err != nil {
+				return nil, false, err
+			}
+			for range spanLcl {
 				entries = append(entries, ondisk.LClusterIndex{
 					Advise: ondisk.LClusterTypePlain, ClusterOfs: 0,
-					Union: uint32(lb),
+					Union: uint32(nblocks),
 				})
-				blockOf = append(blockOf, lb)
+				blockOf = append(blockOf, nblocks)
+				nblocks++
 			}
 		}
 		lcn = groupEnd
 	}
+	if err := checkLazyEnd(ino, r, read); err != nil {
+		return nil, false, err
+	}
 
 	if !anyBig {
 		// Nothing benefited from a big pcluster -- store flat instead.
-		return nil, false
+		return nil, false, nil
 	}
 
 	return &compressedFileData{
-		blocks:       blocks,
+		nblocks:      nblocks,
 		indexEntries: entries,
 		blockOf:      blockOf,
 		lclusterSize: bs,
-	}, true
+	}, true, nil
 }
 
 // compressGroup compresses one pcluster's worth of bytes as a single unit.
 // Returns (compressed, true) when compression produced output; (nil, false)
-// when the data is incompressible (LZ4 reports no gain).
+// when the data is incompressible (LZ4 reports no gain). The result is valid
+// until the next call.
 func (b *Builder) compressGroup(group []byte) ([]byte, bool) {
 	switch b.compression {
 	case CompressionAutoLZ4:
-		dst := make([]byte, lz4.CompressBlockBound(len(group)))
+		bound := lz4.CompressBlockBound(len(group))
+		if cap(b.compBuf) < bound {
+			b.compBuf = make([]byte, bound)
+		}
+		dst := b.compBuf[:bound]
 		var n int
 		var err error
 		if b.compressionLevel > 0 {
@@ -227,7 +250,9 @@ func (b *Builder) compressGroup(group []byte) ([]byte, bool) {
 		if err != nil {
 			return nil, false
 		}
-		return enc.EncodeAll(group, nil), true
+		out := enc.EncodeAll(group, b.compBuf[:0])
+		b.compBuf = out[:0]
+		return out, true
 	default:
 		return nil, false
 	}
@@ -235,12 +260,14 @@ func (b *Builder) compressGroup(group []byte) ([]byte, bool) {
 
 // compressedFileData holds the compression results for a single file.
 //
-// blocks is the dense, ordered list of physical blocks (each blockSize bytes)
-// the inode occupies. indexEntries has one entry per logical lcluster. blockOf
-// maps each index entry to its local block index within blocks, or -1 for
-// entries that own no block (NONHEAD continuations and partial-tail markers).
+// The inode occupies nblocks dense physical blocks (each blockSize bytes),
+// which start at spoolOff in the spool until step 7 copies them to the image.
+// indexEntries has one entry per logical lcluster. blockOf maps each index
+// entry to its local block index, or -1 for entries that own no block (NONHEAD
+// continuations and partial-tail markers).
 type compressedFileData struct {
-	blocks       [][]byte
+	spoolOff     int64
+	nblocks      int
 	indexEntries []ondisk.LClusterIndex
 	blockOf      []int
 	lclusterSize int
@@ -260,7 +287,7 @@ func (b *Builder) writeCompressedInode(ino *buildInode, cdata *compressedFileDat
 		Format:    uint16(ondisk.InodeLayoutExtended) | uint16(ondisk.InodeCompressedFull)<<ondisk.IDataLayoutBit,
 		Mode:      erofsModeFromFS(ino.mode),
 		Size:      uint64(ino.size),
-		U:         uint32(len(cdata.blocks)), // blocks_lo = total physical blocks
+		U:         uint32(cdata.nblocks), // blocks_lo = total physical blocks
 		UID:       ino.uid,
 		GID:       ino.gid,
 		Mtime:     mtSec,
@@ -340,19 +367,14 @@ func (b *Builder) layoutCompressedBlocks(ino *buildInode, cdata *compressedFileD
 		}
 	}
 	ino.startBlk = uint64(base)
-	*startBlk += int64(len(cdata.blocks))
+	*startBlk += int64(cdata.nblocks)
 }
 
-// writeCompressedBlocks writes the inode's dense block list contiguously
-// starting at ino.startBlk.
+// writeCompressedBlocks copies the inode's dense blocks from the spool to the
+// image, contiguously starting at ino.startBlk.
 func (b *Builder) writeCompressedBlocks(ino *buildInode, cdata *compressedFileData) error {
-	for i, blk := range cdata.blocks {
-		off := (int64(ino.startBlk) + int64(i)) * int64(b.blockSize)
-		if _, err := b.w.WriteAt(blk, off); err != nil {
-			return err
-		}
-	}
-	return nil
+	bs := int64(b.blockSize)
+	return b.copyFromSpool(cdata.spoolOff, int64(cdata.nblocks)*bs, int64(ino.startBlk)*bs)
 }
 
 // lz4HCCompressor returns a reusable high-compression LZ4 compressor whose

@@ -49,7 +49,8 @@ type buildInode struct {
 	uid, gid   uint32
 	size       int64
 	mtime      time.Time
-	data       []byte // file content or symlink target
+	data       []byte                        // file content or symlink target
+	open       func() (io.ReadCloser, error) // deferred regular-file source
 	dataLayout uint8
 	startBlk   uint64
 	metaOff    int64 // absolute byte offset where metadata is written
@@ -157,6 +158,27 @@ func (b *Builder) AddFile(p string, info fs.FileInfo, data []byte) error {
 	return nil
 }
 
+// AddFileFunc adds a regular file read from open during Build. Build calls
+// open once for a nonempty file, reads exactly size bytes, and closes it before
+// opening another file. It does not call open for an empty file.
+func (b *Builder) AddFileFunc(p string, info fs.FileInfo, size int64, open func() (io.ReadCloser, error)) error {
+	p = cleanPath(p)
+	if p == "/" {
+		return fmt.Errorf("erofs: cannot add file at root")
+	}
+	if size < 0 {
+		return fmt.Errorf("erofs: negative size for %s: %d", p, size)
+	}
+	if open == nil && size > 0 {
+		return fmt.Errorf("erofs: nil open function for %s", p)
+	}
+
+	ino := &buildInode{path: p, mode: info.Mode(), size: size, mtime: info.ModTime(), open: open}
+	b.inodes = append(b.inodes, ino)
+	b.addToParent(p, ino)
+	return nil
+}
+
 // AddDir adds a directory to the image.
 func (b *Builder) AddDir(p string, info fs.FileInfo) error {
 	p = cleanPath(p)
@@ -199,7 +221,8 @@ func (b *Builder) AddSymlink(p string, target string, info fs.FileInfo) error {
 	return nil
 }
 
-// AddFromFS walks an fs.FS and adds all entries to the image.
+// AddFromFS walks an fs.FS and adds all entries to the image. Regular files
+// are opened during Build; if their size changes after the walk, Build fails.
 func (b *Builder) AddFromFS(fsys fs.FS) error {
 	return fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -234,11 +257,9 @@ func (b *Builder) AddFromFS(fsys fs.FS) error {
 			return b.AddSymlink(imgPath, target, info)
 
 		case d.Type().IsRegular():
-			data, err := fs.ReadFile(fsys, p)
-			if err != nil {
-				return fmt.Errorf("erofs: read %s: %w", p, err)
-			}
-			return b.AddFile(imgPath, info, data)
+			return b.AddFileFunc(imgPath, info, info.Size(), func() (io.ReadCloser, error) {
+				return fsys.Open(p)
+			})
 
 		default:
 			// Skip unsupported types (devices, pipes, sockets).
@@ -266,10 +287,16 @@ func (b *Builder) Build() error {
 
 	// Ensure parent directories exist for all inodes.
 	b.ensureParentDirs()
+	b.sortInodes()
 
 	// Step 2: Build directory entries.
 	if err := b.buildDirEntries(); err != nil {
 		return err
+	}
+	if b.compressEnabled && b.compression != CompressionNone {
+		if err := b.loadLazyData(); err != nil {
+			return err
+		}
 	}
 
 	// Step 3: Decide data layout and compute metadata sizes.
@@ -302,6 +329,9 @@ func (b *Builder) Build() error {
 
 	// Step 7: Write data blocks.
 	if err := b.writeDataBlocks(); err != nil {
+		return err
+	}
+	if err := b.writeLazyData(); err != nil {
 		return err
 	}
 
@@ -555,7 +585,7 @@ func (b *Builder) computeLayouts() {
 			continue
 		}
 
-		dataLen := int64(len(ino.data))
+		dataLen := ino.size
 		inodeHeaderSize := 64 // extended inode only
 		tailSize := int(dataLen) % b.blockSize
 		if dataLen == 0 {
@@ -592,9 +622,7 @@ func (b *Builder) computeLayouts() {
 // 0-1023 are zero padding and bytes 1024-1167 are the superblock,
 // so the first usable metadata offset is 1168 (aligned up to slot
 // boundary = 1184, NID = 37).
-func (b *Builder) assignNIDs() {
-	b.metaBlkAddr = 0
-
+func (b *Builder) sortInodes() {
 	// Sort inodes: root first, then directories, then files/symlinks.
 	sort.SliceStable(b.inodes, func(i, j int) bool {
 		a, bI := b.inodes[i], b.inodes[j]
@@ -611,6 +639,11 @@ func (b *Builder) assignNIDs() {
 		}
 		return a.path < bI.path
 	})
+}
+
+func (b *Builder) assignNIDs() {
+	b.metaBlkAddr = 0
+	b.sortInodes()
 
 	// Start after the superblock and, for zstd, the compression-config area.
 	// Superblock ends at SuperOffset + SuperBlockSize (1024 + 144 = 1168);
@@ -718,15 +751,15 @@ func (b *Builder) layoutDataBlocks() {
 
 		case ondisk.InodeFlatInline:
 			// FLAT_INLINE: inline tail, but preceding blocks if data > blockSize.
-			if int64(len(ino.data)) > int64(b.blockSize) {
-				precedingSize := int64(len(ino.data)) - int64(len(ino.data))%int64(b.blockSize)
+			if ino.size > int64(b.blockSize) {
+				precedingSize := ino.size - ino.size%int64(b.blockSize)
 				precedingBlocks := precedingSize / int64(b.blockSize)
 				ino.startBlk = uint64(currentBlk)
 				currentBlk += precedingBlocks
 			}
 
 		case ondisk.InodeFlatPlain:
-			dataLen := int64(len(ino.data))
+			dataLen := ino.size
 			if dataLen == 0 {
 				continue
 			}
@@ -826,7 +859,7 @@ func (b *Builder) writeInode(ino *buildInode) error {
 	}
 
 	// Write inline tail data if FLAT_INLINE.
-	if ino.dataLayout == ondisk.InodeFlatInline && len(ino.data) > 0 {
+	if ino.open == nil && ino.dataLayout == ondisk.InodeFlatInline && ino.size > 0 {
 		var tailData []byte
 		if int64(len(ino.data)) <= int64(b.blockSize) {
 			// Entire data is inline.
@@ -848,7 +881,7 @@ func (b *Builder) writeInode(ino *buildInode) error {
 // writeDataBlocks writes out-of-line data blocks.
 func (b *Builder) writeDataBlocks() error {
 	for _, ino := range b.inodes {
-		if len(ino.data) == 0 {
+		if ino.open != nil || ino.size == 0 {
 			continue
 		}
 
@@ -883,6 +916,140 @@ func (b *Builder) writeDataBlocks() error {
 				}
 			}
 			// Inline tail is already written in writeMetadata.
+		}
+	}
+	return nil
+}
+
+// withLazyReader keeps at most one source open and reports close failures.
+func (b *Builder) withLazyReader(ino *buildInode, read func(io.Reader) error) (err error) {
+	r, err := ino.open()
+	if err != nil {
+		return fmt.Errorf("erofs: opening %s: %w", ino.path, err)
+	}
+	if r == nil {
+		return fmt.Errorf("erofs: opening %s: nil reader", ino.path)
+	}
+	defer func() {
+		if closeErr := r.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("erofs: closing %s: %w", ino.path, closeErr)
+		}
+	}()
+	return read(r)
+}
+
+func lazySizeError(ino *buildInode, read int64) error {
+	return fmt.Errorf("erofs: %s: declared size %d, read %d bytes", ino.path, ino.size, read)
+}
+
+func checkLazyEnd(ino *buildInode, r io.Reader, read int64) error {
+	var extra [1]byte
+	n, err := r.Read(extra[:])
+	if n != 0 {
+		return lazySizeError(ino, read+int64(n))
+	}
+	if err != io.EOF {
+		if err != nil {
+			return fmt.Errorf("erofs: reading %s: %w", ino.path, err)
+		}
+		return fmt.Errorf("erofs: reading %s: reader returned no data and no EOF", ino.path)
+	}
+	return nil
+}
+
+// loadLazyData preserves the existing compression path, which needs full files
+// before it can choose layouts. Flat builds never call this method.
+func (b *Builder) loadLazyData() error {
+	for _, ino := range b.inodes {
+		if ino.open == nil {
+			continue
+		}
+		if ino.size == 0 {
+			ino.open = nil
+			continue
+		}
+		err := b.withLazyReader(ino, func(r io.Reader) error {
+			data, err := io.ReadAll(io.LimitReader(r, ino.size))
+			if err != nil {
+				return fmt.Errorf("erofs: reading %s: %w", ino.path, err)
+			}
+			if int64(len(data)) != ino.size {
+				return lazySizeError(ino, int64(len(data)))
+			}
+			if err := checkLazyEnd(ino, r, ino.size); err != nil {
+				return err
+			}
+			ino.data = data
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		ino.open = nil
+	}
+	return nil
+}
+
+// writeLazyData copies flat files directly from their sources to final offsets.
+func (b *Builder) writeLazyData() error {
+	buf := make([]byte, b.blockSize)
+	for _, ino := range b.inodes {
+		if ino.open == nil || ino.size == 0 {
+			continue
+		}
+		err := b.withLazyReader(ino, func(r io.Reader) error {
+			var read int64
+			full := ino.size / int64(b.blockSize)
+			off := int64(ino.startBlk) * int64(b.blockSize)
+			write := func(p []byte, at int64) error {
+				n, err := b.w.WriteAt(p, at)
+				if err != nil {
+					return fmt.Errorf("erofs: writing %s: %w", ino.path, err)
+				}
+				if n != len(p) {
+					return fmt.Errorf("erofs: writing %s: %w", ino.path, io.ErrShortWrite)
+				}
+				return nil
+			}
+			readPart := func(p []byte) error {
+				n, err := io.ReadFull(r, p)
+				read += int64(n)
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					return lazySizeError(ino, read)
+				}
+				if err != nil {
+					return fmt.Errorf("erofs: reading %s: %w", ino.path, err)
+				}
+				return nil
+			}
+			for range full {
+				if err := readPart(buf); err != nil {
+					return err
+				}
+				if err := write(buf, off); err != nil {
+					return err
+				}
+				off += int64(b.blockSize)
+			}
+			if tail := int(ino.size % int64(b.blockSize)); tail > 0 {
+				if err := readPart(buf[:tail]); err != nil {
+					return err
+				}
+				if ino.dataLayout == ondisk.InodeFlatInline {
+					if err := write(buf[:tail], ino.metaOff+64); err != nil {
+						return err
+					}
+				} else {
+					clear(buf[tail:])
+					if err := write(buf, off); err != nil {
+						return err
+					}
+				}
+			}
+			return checkLazyEnd(ino, r, read)
+		})
+		if err != nil {
+			return err
 		}
 	}
 	return nil

@@ -1,3 +1,10 @@
+## Unreleased (v0.7.0)
+
+### Features
+
+* Add `Builder.AddFileFunc` for deferred file sources and bounded-memory flat builds.
+* Make `AddFromFS` open regular files during `Build` instead of keeping their contents in memory. A file that changes size after the walk now makes `Build` fail.
+
 ## [0.6.1](https://github.com/Xe/erofs/compare/v0.6.0...v0.6.1) (2026-07-10)
 
 

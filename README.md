@@ -84,6 +84,7 @@ an existing `fs.FS`:
 package main
 
 import (
+    "io"
     "log"
     "os"
     "time"
@@ -123,12 +124,20 @@ b := erofs.NewBuilder(out, erofs.WithEpoch(time.Now()))
 
 b.AddDir("/etc", dirInfo)
 b.AddFile("/etc/hostname", fileInfo, []byte("myhost\n"))
+b.AddFileFunc("/var/archive", archiveInfo, archiveInfo.Size(), func() (io.ReadCloser, error) {
+    return os.Open("archive.tar")
+})
 b.AddSymlink("/etc/localtime", "/usr/share/zoneinfo/UTC", linkInfo)
 
 if err := b.Build(); err != nil {
     log.Fatal(err)
 }
 ```
+
+`AddFileFunc` opens each nonempty file during `Build` and closes it before
+opening the next one. Without compression, file content is copied with a
+single block-sized buffer. `AddFromFS` uses the same path; files must keep
+their measured size until `Build` completes.
 
 ## CLI tools
 

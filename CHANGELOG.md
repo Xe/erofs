@@ -1,3 +1,10 @@
+# [0.7.0](https://github.com/Xe/erofs/compare/v0.6.1...v0.7.0) (2026-09-23)
+
+
+### Features
+
+* **builder:** stream flat file sources during image builds ([#8](https://github.com/Xe/erofs/issues/8)) ([8488f53](https://github.com/Xe/erofs/commit/8488f533a767b895801618f1911201a4a5a8def8))
+
 ## Unreleased (v0.7.0)
 
 ### Features

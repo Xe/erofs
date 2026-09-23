@@ -1,3 +1,10 @@
+# [0.8.0](https://github.com/Xe/erofs/compare/v0.7.0...v0.8.0) (2026-09-23)
+
+
+### Features
+
+* **builder:** stream compressed builds and fix four builder bugs ([#9](https://github.com/Xe/erofs/issues/9)) ([8e7c61f](https://github.com/Xe/erofs/commit/8e7c61f5bc935df0bc2bfe2c707d4eda5eda90df))
+
 ## Unreleased (v0.8.0)
 
 ### Features

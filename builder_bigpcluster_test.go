@@ -55,8 +55,8 @@ func TestBuilderBigPClusterEncoding(t *testing.T) {
 	if len(cdata.indexEntries) != (fsize+4095)/4096 { // ceil(40000/4096) = 10
 		t.Fatalf("indexEntries = %d, want %d", len(cdata.indexEntries), (fsize+4095)/4096)
 	}
-	if len(cdata.blocks) >= len(cdata.indexEntries) {
-		t.Fatalf("blocks = %d, want < %d (no packing happened)", len(cdata.blocks), len(cdata.indexEntries))
+	if cdata.nblocks >= len(cdata.indexEntries) {
+		t.Fatalf("blocks = %d, want < %d (no packing happened)", cdata.nblocks, len(cdata.indexEntries))
 	}
 	e := cdata.indexEntries
 	if e[0].Type() != ondisk.LClusterTypeHead1 {
@@ -65,8 +65,8 @@ func TestBuilderBigPClusterEncoding(t *testing.T) {
 	if e[1].Type() != ondisk.LClusterTypeNonHead || e[1].Delta0()&ondisk.LID0CBlkCnt == 0 {
 		t.Fatalf("entry 1 must be NONHEAD with D0_CBLKCNT, got type=%d delta0=0x%x", e[1].Type(), e[1].Delta0())
 	}
-	if cblk := e[1].Delta0() &^ uint16(ondisk.LID0CBlkCnt); int(cblk) != len(cdata.blocks) {
-		t.Fatalf("cblkcnt = %d, want %d", cblk, len(cdata.blocks))
+	if cblk := e[1].Delta0() &^ uint16(ondisk.LID0CBlkCnt); int(cblk) != cdata.nblocks {
+		t.Fatalf("cblkcnt = %d, want %d", cblk, cdata.nblocks)
 	}
 	last := e[len(e)-1]
 	if last.Type() != ondisk.LClusterTypePlain || last.ClusterOfs != uint16(fsize%4096) {

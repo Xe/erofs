@@ -19,7 +19,8 @@ import (
 
 // Builder creates EROFS filesystem images.
 type Builder struct {
-	w                io.WriterAt
+	w                io.WriterAt  // the output, wrapped by out
+	out              *imageWriter // tracks block 0 and the end of the output
 	blockSize        int
 	blkSzBits        uint8
 	pclusterBits     uint8 // log2 of pcluster size; 0 = auto (blkSzBits+4)
@@ -135,6 +136,8 @@ func NewBuilder(w io.WriterAt, opts ...BuildOption) *Builder {
 	for _, opt := range opts {
 		opt(b)
 	}
+	b.out = newImageWriter(w, b.blockSize)
+	b.w = b.out
 	return b
 }
 
@@ -190,9 +193,14 @@ func (b *Builder) AddDir(p string, info fs.FileInfo) error {
 	}
 
 	b.inodes = append(b.inodes, ino)
-	b.dirs[p] = &buildDir{
-		inode:    ino,
-		children: make(map[string]*buildInode),
+	if d, ok := b.dirs[p]; ok && d.inode == nil {
+		// A child was added first. Keep the children of the placeholder.
+		d.inode = ino
+	} else {
+		b.dirs[p] = &buildDir{
+			inode:    ino,
+			children: make(map[string]*buildInode),
+		}
 	}
 
 	if p != "/" {
@@ -270,22 +278,10 @@ func (b *Builder) AddFromFS(fsys fs.FS) error {
 
 // Build finalizes the image and writes it to the underlying writer.
 func (b *Builder) Build() error {
-	// Step 1: Ensure root directory exists.
+	// Step 1: Ensure the root directory and all parent directories exist.
 	if _, ok := b.dirs["/"]; !ok {
-		now := time.Unix(b.epoch, 0)
-		ino := &buildInode{
-			path:  "/",
-			mode:  fs.ModeDir | 0o755,
-			mtime: now,
-		}
-		b.inodes = append([]*buildInode{ino}, b.inodes...)
-		b.dirs["/"] = &buildDir{
-			inode:    ino,
-			children: make(map[string]*buildInode),
-		}
+		b.dirs["/"] = &buildDir{children: make(map[string]*buildInode)}
 	}
-
-	// Ensure parent directories exist for all inodes.
 	b.ensureParentDirs()
 	b.sortInodes()
 
@@ -372,48 +368,30 @@ func (b *Builder) addToParent(p string, ino *buildInode) {
 	d.children[path.Base(p)] = ino
 }
 
-// ensureParentDirs creates any missing intermediate directories.
+// ensureParentDirs creates an inode for each directory that was never added
+// with AddDir. addToParent leaves such a directory in b.dirs with a nil inode.
+// Creating it registers it with its own parent, which can add a new
+// placeholder, so repeat until no placeholder is left.
 func (b *Builder) ensureParentDirs() {
 	for {
 		added := false
-		for p := range b.dirs {
-			if p == "/" {
+		for p, d := range b.dirs {
+			if d.inode != nil {
 				continue
 			}
-			parent := path.Dir(p)
-			if parent == "." {
-				parent = "/"
+			d.inode = &buildInode{
+				path:  p,
+				mode:  fs.ModeDir | 0o755,
+				mtime: time.Unix(b.epoch, 0),
 			}
-			if _, ok := b.dirs[parent]; !ok {
-				now := time.Unix(b.epoch, 0)
-				ino := &buildInode{
-					path:  parent,
-					mode:  fs.ModeDir | 0o755,
-					mtime: now,
-				}
-				b.inodes = append(b.inodes, ino)
-				b.dirs[parent] = &buildDir{
-					inode:    ino,
-					children: make(map[string]*buildInode),
-				}
-				b.addToParent(parent, ino)
-				added = true
+			b.inodes = append(b.inodes, d.inode)
+			if p != "/" {
+				b.addToParent(p, d.inode)
 			}
+			added = true
 		}
 		if !added {
 			break
-		}
-	}
-
-	// Ensure all dirs have their inode set.
-	for p, d := range b.dirs {
-		if d.inode == nil {
-			for _, ino := range b.inodes {
-				if ino.path == p {
-					d.inode = ino
-					break
-				}
-			}
 		}
 	}
 }
@@ -1177,17 +1155,21 @@ func (b *Builder) writeSuperblock() error {
 		return fmt.Errorf("erofs: writing superblock: %w", err)
 	}
 
-	// Compute CRC32-C checksum.
-	// Read back the full first block to compute the checksum.
-	block := make([]byte, b.blockSize)
-	if r, ok := b.w.(io.ReaderAt); ok {
-		if _, err := r.ReadAt(block, 0); err != nil {
+	// Pad the image to the block count in the superblock, as mkfs.erofs does.
+	// This also makes sure that the first block below is complete.
+	if err := b.out.padTo(int64(totalBlocks) * int64(b.blockSize)); err != nil {
+		return fmt.Errorf("erofs: padding image: %w", err)
+	}
+
+	// Compute CRC32-C checksum over the first block. Read it back if the
+	// output allows it, so that the checksum also covers bytes that the
+	// builder did not write. Otherwise use the copy that b.out kept.
+	block := b.out.first
+	if r, ok := b.out.w.(io.ReaderAt); ok {
+		block = make([]byte, b.blockSize)
+		if n, err := r.ReadAt(block, 0); err != nil && !(err == io.EOF && n == len(block)) {
 			return fmt.Errorf("erofs: reading first block for checksum: %w", err)
 		}
-	} else {
-		// If the writer is not also a reader, we need to reconstruct the block.
-		// Write zeros + superblock into our buffer.
-		copy(block[ondisk.SuperOffset:], sbBytes)
 	}
 
 	// CRC input starts after the checksum field.
